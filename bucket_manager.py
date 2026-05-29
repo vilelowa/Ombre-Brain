@@ -55,6 +55,7 @@ class BucketManager:
         # --- Read storage paths from config / 从配置中读取存储路径 ---
         self.base_dir = config["buckets_dir"]
         self.permanent_dir = os.path.join(self.base_dir, "permanent")
+        self.core_dir = os.path.join(self.permanent_dir, "core")
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
         self.feel_dir = os.path.join(self.base_dir, "feel")
@@ -195,6 +196,61 @@ class BucketManager:
         )
         return bucket_id
 
+    async def create_dream_reflection(
+        self,
+        content: str,
+        influence_type: str,
+        source_bucket_ids: list[str] = None,
+        valence: float = 0.5,
+        arousal: float = 0.3,
+        name: str = None,
+    ) -> str:
+        """
+        Store a dream reflection under feel/dream/.
+        This is storage only; generation and slot pruning live above this layer.
+        """
+        allowed = {"tone", "attention", "unresolved"}
+        if influence_type not in allowed:
+            raise ValueError(f"influence_type must be one of: {', '.join(sorted(allowed))}")
+
+        bucket_id = generate_bucket_id()
+        bucket_name = sanitize_name(name) if name else bucket_id
+        metadata = {
+            "id": bucket_id,
+            "name": bucket_name,
+            "tags": [],
+            "domain": [],
+            "valence": max(0.0, min(1.0, valence)),
+            "arousal": max(0.0, min(1.0, arousal)),
+            "importance": 5,
+            "type": "feel",
+            "reflection_type": "dream",
+            "influence_type": influence_type,
+            "source_bucket_ids": source_bucket_ids or [],
+            "created": now_iso(),
+            "last_active": now_iso(),
+            "activation_count": 0,
+        }
+        post = frontmatter.Post(content, **metadata)
+
+        target_dir = os.path.join(self.feel_dir, "dream")
+        os.makedirs(target_dir, exist_ok=True)
+        if bucket_name and bucket_name != bucket_id:
+            filename = f"{bucket_name}_{bucket_id}.md"
+        else:
+            filename = f"{bucket_id}.md"
+        file_path = safe_path(target_dir, filename)
+
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+        except OSError as e:
+            logger.error(f"Failed to write dream reflection / 写入梦反思失败: {file_path}: {e}")
+            raise
+
+        logger.info(f"Created dream reflection / 创建梦反思: {bucket_id} ({influence_type})")
+        return bucket_id
+
     # ---------------------------------------------------------
     # Read bucket content
     # 读取桶内容
@@ -234,7 +290,8 @@ class BucketManager:
     # ---------------------------------------------------------
     # Update bucket
     # 更新桶
-    # Supports: content, tags, importance, valence, arousal, name, resolved
+    # Supports: content, tags, importance, valence, arousal, name, resolved,
+    # dream_candidate
     # ---------------------------------------------------------
     async def update(self, bucket_id: str, **kwargs) -> bool:
         """
@@ -280,6 +337,8 @@ class BucketManager:
                 post["importance"] = 10  # pinned → lock importance to 10
         if "digested" in kwargs:
             post["digested"] = bool(kwargs["digested"])
+        if "dream_candidate" in kwargs:
+            post["dream_candidate"] = bool(kwargs["dream_candidate"])
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
 
@@ -635,6 +694,8 @@ class BucketManager:
             if not os.path.exists(dir_path):
                 continue
             for root, _, files in os.walk(dir_path):
+                if self._is_core_path(root):
+                    continue
                 for filename in files:
                     if not filename.endswith(".md"):
                         continue
@@ -644,6 +705,126 @@ class BucketManager:
                         buckets.append(bucket)
 
         return buckets
+
+    # ---------------------------------------------------------
+    # Core layer: read permanent identity/context outside breath/search
+    # Core 层：读取不参与 breath/search 的永久身份上下文
+    # ---------------------------------------------------------
+    async def list_core(self) -> list[dict]:
+        """
+        Read Markdown entries from permanent/core/.
+        Core entries are injected directly by callers and are excluded from
+        normal list/search/decay paths.
+        """
+        entries = []
+        if not os.path.exists(self.core_dir):
+            return entries
+
+        for root, _, files in os.walk(self.core_dir):
+            for filename in files:
+                if not filename.endswith(".md"):
+                    continue
+                file_path = os.path.join(root, filename)
+                entry = self._load_bucket(file_path)
+                if entry:
+                    entries.append(entry)
+
+        entries.sort(
+            key=lambda e: (
+                int(e["metadata"].get("order", 999)),
+                str(e["metadata"].get("since", e["metadata"].get("created", ""))),
+                str(e["metadata"].get("name", e["id"])),
+            )
+        )
+        return entries
+
+    async def render_core_context(self, max_tokens: int = 4000) -> str:
+        """
+        Render core entries into a stable context block for direct injection.
+        """
+        entries = await self.list_core()
+        if not entries:
+            return ""
+
+        max_tokens = max(1, max_tokens)
+        parts = []
+        used = 0
+        for entry in entries:
+            meta = entry.get("metadata", {})
+            title = meta.get("name", entry["id"])
+            since = meta.get("since")
+            influence = meta.get("influence_type")
+            details = []
+            if since:
+                details.append(f"since:{since}")
+            if influence:
+                details.append(f"influence:{influence}")
+            header = f"[core:{title}]"
+            if details:
+                header += " " + " ".join(details)
+            block = f"{header}\n{entry.get('content', '').strip()}"
+            block_tokens = max(1, len(block) // 4)
+            if used + block_tokens > max_tokens:
+                break
+            parts.append(block)
+            used += block_tokens
+
+        return "\n---\n".join(parts)
+
+    async def list_dream_candidates(self, limit: int = 20) -> list[dict]:
+        """
+        Return active buckets flagged as dream material.
+        Archived/core entries are excluded; resolved/digested buckets may still
+        be dream material because they can carry unfinished meaning.
+        """
+        limit = max(1, limit)
+        buckets = await self.list_all(include_archive=False)
+        candidates = [
+            b for b in buckets
+            if b["metadata"].get("dream_candidate", False)
+            and b["metadata"].get("type") not in ("permanent", "feel", "archived", "core")
+            and not b["metadata"].get("pinned", False)
+            and not b["metadata"].get("protected", False)
+        ]
+        candidates.sort(
+            key=lambda b: (
+                b["metadata"].get("dream_priority", 0),
+                b["metadata"].get("created", ""),
+            ),
+            reverse=True,
+        )
+        return candidates[:limit]
+
+    async def list_dream_reflections(
+        self,
+        limit: int = 10,
+        influence_type: str = None,
+    ) -> list[dict]:
+        """
+        Return stored dream reflections from feel/dream/, newest first.
+        """
+        limit = max(1, limit)
+        dream_dir = os.path.join(self.feel_dir, "dream")
+        reflections = []
+        if not os.path.exists(dream_dir):
+            return reflections
+
+        for root, _, files in os.walk(dream_dir):
+            for filename in files:
+                if not filename.endswith(".md"):
+                    continue
+                entry = self._load_bucket(os.path.join(root, filename))
+                if not entry:
+                    continue
+                meta = entry.get("metadata", {})
+                if meta.get("type") != "feel" or meta.get("reflection_type") != "dream":
+                    continue
+                if influence_type and meta.get("influence_type") != influence_type:
+                    continue
+                reflections.append(entry)
+
+        reflections.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+        return reflections[:limit]
 
     # ---------------------------------------------------------
     # Statistics (counts per category + total size)
@@ -672,6 +853,8 @@ class BucketManager:
             if not os.path.exists(subdir):
                 continue
             for root, _, files in os.walk(subdir):
+                if self._is_core_path(root):
+                    continue
                 for f in files:
                     if f.endswith(".md"):
                         stats[key] += 1
@@ -745,6 +928,8 @@ class BucketManager:
             if not os.path.exists(dir_path):
                 continue
             for root, _, files in os.walk(dir_path):
+                if self._is_core_path(root):
+                    continue
                 for fname in files:
                     if not fname.endswith(".md"):
                         continue
@@ -754,6 +939,13 @@ class BucketManager:
                     if name_part == bucket_id or name_part.endswith(f"_{bucket_id}"):
                         return os.path.join(root, fname)
         return None
+
+    def _is_core_path(self, path: str) -> bool:
+        """Whether path is permanent/core or a descendant."""
+        try:
+            return os.path.commonpath([os.path.abspath(path), os.path.abspath(self.core_dir)]) == os.path.abspath(self.core_dir)
+        except ValueError:
+            return False
 
     # ---------------------------------------------------------
     # Internal: load bucket data from .md file

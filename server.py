@@ -495,6 +495,21 @@ async def _merge_or_create(
 # 有参数：按关键词+情感坐标检索记忆
 # =============================================================
 @mcp.tool()
+async def core(max_tokens: int = 4000) -> str:
+    """读取 Core layer。Core 是身份/关系/承诺等直接注入上下文,不走 breath/search/decay。"""
+    max_tokens = min(max(1, max_tokens), 12000)
+    try:
+        context = await bucket_mgr.render_core_context(max_tokens=max_tokens)
+    except Exception as e:
+        logger.error(f"Core layer read failed / Core 层读取失败: {e}")
+        return "Core layer 暂时无法访问。"
+
+    if not context:
+        return "Core layer 为空。"
+    return "=== Core Layer ===\n" + context
+
+
+@mcp.tool()
 async def breath(
     query: str = "",
     max_tokens: int = 10000,
@@ -987,10 +1002,11 @@ async def trace(
     resolved: int = -1,
     pinned: int = -1,
     digested: int = -1,
+    dream_candidate: int = -1,
     content: str = "",
     delete: bool = False,
 ) -> str:
-    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
+    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,dream_candidate=1标记做梦素材/0取消,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -1028,6 +1044,8 @@ async def trace(
             updates["importance"] = 10  # pinned → lock importance
     if digested in (0, 1):
         updates["digested"] = bool(digested)
+    if dream_candidate in (0, 1):
+        updates["dream_candidate"] = bool(dream_candidate)
     if content:
         updates["content"] = content
 
@@ -1144,6 +1162,7 @@ async def dream() -> str:
     await decay_engine.ensure_started()
 
     try:
+        flagged = await bucket_mgr.list_dream_candidates(limit=10)
         all_buckets = await bucket_mgr.list_all(include_archive=False)
     except Exception as e:
         logger.error(f"Dream failed to list buckets: {e}")
@@ -1157,9 +1176,15 @@ async def dream() -> str:
         and not b["metadata"].get("protected", False)
     ]
 
-    # --- Sort by creation time desc, take top 10 ---
-    candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
-    recent = candidates[:10]
+    # --- Flagged dream material takes priority; otherwise fall back to recent memories ---
+    # --- 已标记的做梦素材优先；没有时回退到最近记忆 ---
+    if flagged:
+        recent = flagged
+        source_label = "已标记的做梦素材"
+    else:
+        candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+        recent = candidates[:10]
+        source_label = "最近的记忆"
 
     if not recent:
         return "没有需要消化的新记忆。"
@@ -1182,7 +1207,7 @@ async def dream() -> str:
 
     header = (
         "=== Dreaming ===\n"
-        "以下是你最近的记忆。用第一人称想：\n"
+        f"以下是{source_label}。用第一人称想：\n"
         "- 这些东西里有什么在你这里留下了重量？\n"
         "- 有什么还没想清楚？\n"
         "- 有什么可以放下了？\n"
