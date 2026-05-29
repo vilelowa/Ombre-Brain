@@ -16,6 +16,7 @@ import pytest_asyncio
 import math
 import pytest
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from tests.dataset import DATASET
 
@@ -171,6 +172,163 @@ class TestDecayScoreModifiers:
         # Should NOT have 1.5× boost (resolved=True cancels urgency)
         meta_low = self._base_meta(arousal=0.8, resolved=True)
         assert score == decay_eng.calculate_score(meta_low)
+
+
+# ============================================================
+# Behaviour spec bug regressions
+# ============================================================
+class TestBehaviorSpecBugFixes:
+    """Lock B-01/B-03 through B-10 decay, scoring, and activation semantics."""
+
+    @pytest.mark.asyncio
+    async def test_b01_resolved_update_does_not_archive_bucket(self, bucket_mgr):
+        """resolved=True should sink a bucket, not move it to archive immediately."""
+        bid = await bucket_mgr.create(
+            content="b01_unique_keyword 这条记忆只是被放下，不该立刻归档",
+            importance=7,
+            domain=["测试"],
+            bucket_type="dynamic",
+        )
+        before_path = bucket_mgr._find_bucket_file(bid)
+
+        assert await bucket_mgr.update(bid, resolved=True) is True
+
+        after_path = bucket_mgr._find_bucket_file(bid)
+        updated = await bucket_mgr.get(bid)
+        active_ids = {b["id"] for b in await bucket_mgr.list_all(include_archive=False)}
+
+        assert after_path == before_path
+        assert "/dynamic/" in after_path.replace("\\", "/")
+        assert "/archive/" not in after_path.replace("\\", "/")
+        assert updated["metadata"]["type"] == "dynamic"
+        assert updated["metadata"]["resolved"] is True
+        assert bid in active_ids
+
+    def test_b03_fractional_activation_affects_decay_score(self, decay_eng):
+        """Time ripple's +0.3 activation boost must not be int-truncated."""
+        base = {
+            "importance": 6,
+            "activation_count": 1.0,
+            "created": (datetime.now() - timedelta(days=5)).isoformat(),
+            "last_active": (datetime.now() - timedelta(days=5)).isoformat(),
+            "arousal": 0.4,
+            "type": "dynamic",
+        }
+
+        score_1_0 = decay_eng.calculate_score(base)
+        score_1_3 = decay_eng.calculate_score(base | {"activation_count": 1.3})
+
+        assert score_1_3 > score_1_0
+        assert score_1_3 / score_1_0 == pytest.approx(1.3 ** 0.3, rel=0.01)
+
+    @pytest.mark.asyncio
+    async def test_b04_create_starts_unactivated_then_touch_increments(self, bucket_mgr):
+        """Creating a bucket is not the same as actively recalling it."""
+        bid = await bucket_mgr.create(
+            content="重要的新记忆",
+            importance=9,
+            domain=["测试"],
+            bucket_type="dynamic",
+        )
+
+        created = await bucket_mgr.get(bid)
+        assert created["metadata"]["activation_count"] == 0
+
+        await bucket_mgr.touch(bid)
+        touched = await bucket_mgr.get(bid)
+        assert touched["metadata"]["activation_count"] == 1
+
+    def test_b05_time_score_uses_spec_decay_rate(self, bucket_mgr):
+        """30-day-old memories should retain about 0.55 time proximity."""
+        old = {"last_active": (datetime.now() - timedelta(days=30)).isoformat()}
+
+        assert bucket_mgr._calc_time_score(old) == pytest.approx(math.exp(-0.02 * 30), rel=0.01)
+        assert bucket_mgr._calc_time_score(old) > 0.5
+
+    def test_b06_time_weight_default_is_spec_value(self, test_config):
+        """Default time_proximity weight should be 1.5, not the old 2.5."""
+        from bucket_manager import BucketManager
+
+        config = {**test_config, "scoring_weights": {}}
+        bm = BucketManager(config)
+
+        assert bm.w_time == 1.5
+
+    def test_b07_content_weight_default_is_spec_value(self, test_config):
+        """Body/content relevance should be an auxiliary ×1 signal by default."""
+        from bucket_manager import BucketManager
+
+        config = {**test_config, "scoring_weights": {}}
+        bm = BucketManager(config)
+
+        assert bm.content_weight == 1.0
+
+    @pytest.mark.asyncio
+    async def test_b08_auto_resolve_applies_resolved_factor_same_cycle(self, test_config):
+        """Auto-resolved buckets should be scored as resolved before archive check."""
+        from decay_engine import DecayEngine
+
+        old_ts = (datetime.now() - timedelta(days=31)).isoformat()
+        bucket = {
+            "id": "old-low-importance",
+            "metadata": {
+                "name": "old low importance",
+                "type": "dynamic",
+                "importance": 4,
+                "activation_count": 1,
+                "created": old_ts,
+                "last_active": old_ts,
+                "arousal": 0.3,
+            },
+        }
+
+        class FakeBucketManager:
+            def __init__(self):
+                self.updated = []
+                self.archived = []
+
+            async def list_all(self, include_archive=False):
+                return [bucket]
+
+            async def update(self, bucket_id, **kwargs):
+                self.updated.append((bucket_id, kwargs))
+                return True
+
+            async def archive(self, bucket_id):
+                self.archived.append(bucket_id)
+                return True
+
+        bm = FakeBucketManager()
+        de = DecayEngine(test_config, bm)
+        result = await de.run_decay_cycle()
+
+        assert bm.updated == [("old-low-importance", {"resolved": True})]
+        assert bucket["metadata"]["resolved"] is True
+        assert bm.archived == ["old-low-importance"]
+        assert result["auto_resolved"] == 1
+        assert result["archived"] == 1
+
+    def test_b09_hold_prefers_user_supplied_valence_arousal(self):
+        """hold() should pass explicit user V/A through instead of analyze() V/A."""
+        source = Path("server.py").read_text(encoding="utf-8")
+
+        assert "final_valence = valence if 0 <= valence <= 1 else auto_valence" in source
+        assert "final_arousal = arousal if 0 <= arousal <= 1 else auto_arousal" in source
+        assert "valence=final_valence" in source
+        assert "arousal=final_arousal" in source
+
+    @pytest.mark.asyncio
+    async def test_b10_feel_bucket_preserves_empty_domain(self, bucket_mgr):
+        """feel buckets should keep domain=[] instead of falling back to 未分类."""
+        bid = await bucket_mgr.create(
+            content="这是一条没有主题域的 feel",
+            domain=[],
+            bucket_type="feel",
+        )
+
+        created = await bucket_mgr.get(bid)
+        assert created["metadata"]["type"] == "feel"
+        assert created["metadata"]["domain"] == []
 
 
 # ============================================================
