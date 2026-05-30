@@ -73,3 +73,61 @@ async def test_dream_reflection_rejects_unknown_influence_type(bucket_mgr):
             content="Bad reflection",
             influence_type="mystery",
         )
+
+
+@pytest.mark.asyncio
+async def test_tone_dream_reflections_keep_latest_three(bucket_mgr):
+    created_ids = []
+    for i in range(5):
+        created_ids.append(
+            await bucket_mgr.create_dream_reflection(
+                content=f"Tone reflection {i}",
+                influence_type="tone",
+            )
+        )
+
+    reflections = await bucket_mgr.list_dream_reflections(influence_type="tone")
+    reflection_ids = [r["id"] for r in reflections]
+
+    assert reflection_ids == list(reversed(created_ids[-3:]))
+    assert await bucket_mgr.get(created_ids[0]) is None
+    assert await bucket_mgr.get(created_ids[1]) is None
+
+
+@pytest.mark.asyncio
+async def test_attention_dream_reflections_keep_latest_five(bucket_mgr):
+    created_ids = []
+    for i in range(7):
+        created_ids.append(
+            await bucket_mgr.create_dream_reflection(
+                content=f"Attention reflection {i}",
+                influence_type="attention",
+            )
+        )
+
+    reflections = await bucket_mgr.list_dream_reflections(influence_type="attention")
+    reflection_ids = [r["id"] for r in reflections]
+
+    assert reflection_ids == list(reversed(created_ids[-5:]))
+    assert await bucket_mgr.get(created_ids[0]) is None
+    assert await bucket_mgr.get(created_ids[1]) is None
+
+
+@pytest.mark.asyncio
+async def test_unresolved_dream_reflections_are_not_pruned(bucket_mgr):
+    created_ids = []
+    for i in range(8):
+        created_ids.append(
+            await bucket_mgr.create_dream_reflection(
+                content=f"Unresolved reflection {i}",
+                influence_type="unresolved",
+            )
+        )
+
+    reflections = await bucket_mgr.list_dream_reflections(
+        limit=20,
+        influence_type="unresolved",
+    )
+    reflection_ids = [r["id"] for r in reflections]
+
+    assert reflection_ids == list(reversed(created_ids))

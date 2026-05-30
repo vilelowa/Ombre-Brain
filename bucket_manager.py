@@ -248,8 +248,48 @@ class BucketManager:
             logger.error(f"Failed to write dream reflection / 写入梦反思失败: {file_path}: {e}")
             raise
 
+        await self.prune_dream_reflections(influence_type)
         logger.info(f"Created dream reflection / 创建梦反思: {bucket_id} ({influence_type})")
         return bucket_id
+
+    async def prune_dream_reflections(self, influence_type: str = None) -> int:
+        """
+        Enforce dream reflection slot limits in feel/dream/.
+        tone keeps 3, attention keeps 5, unresolved is unbounded for now.
+        Returns the number of deleted overflow reflections.
+        """
+        slot_limits = {"tone": 3, "attention": 5}
+        influence_types = [influence_type] if influence_type else list(slot_limits.keys())
+        deleted = 0
+
+        for current_type in influence_types:
+            limit = slot_limits.get(current_type)
+            if not limit:
+                continue
+
+            reflections = await self.list_dream_reflections(
+                limit=1000000,
+                influence_type=current_type,
+            )
+            overflow = reflections[limit:]
+            for reflection in overflow:
+                path = reflection.get("path")
+                if not path:
+                    continue
+                try:
+                    os.remove(path)
+                    deleted += 1
+                    logger.info(
+                        "Pruned dream reflection / 修剪梦反思: "
+                        f"{reflection.get('id')} ({current_type})"
+                    )
+                except OSError as e:
+                    logger.error(
+                        "Failed to prune dream reflection / 修剪梦反思失败: "
+                        f"{path}: {e}"
+                    )
+
+        return deleted
 
     # ---------------------------------------------------------
     # Read bucket content
@@ -823,7 +863,13 @@ class BucketManager:
                     continue
                 reflections.append(entry)
 
-        reflections.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+        reflections.sort(
+            key=lambda b: (
+                b["metadata"].get("created", ""),
+                os.stat(b["path"]).st_mtime_ns,
+            ),
+            reverse=True,
+        )
         return reflections[:limit]
 
     # ---------------------------------------------------------
