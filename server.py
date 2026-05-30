@@ -124,6 +124,36 @@ mcp = FastMCP(
 # Sessions stored in memory (lost on restart, 7-day expiry).
 # =============================================================
 _sessions: dict[str, float] = {}  # {token: expiry_timestamp}
+_chat_sessions: dict[str, list[dict]] = {}
+
+
+def _push_subscriptions_file() -> str:
+    return os.path.join(config["buckets_dir"], "push_subscriptions.json")
+
+
+def _load_push_subscriptions() -> list[dict]:
+    try:
+        path = _push_subscriptions_file()
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = _json_lib.load(f)
+            if isinstance(data, list):
+                return data
+    except Exception as e:
+        logger.warning(f"Failed to load push subscriptions: {e}")
+    return []
+
+
+def _save_push_subscriptions(subscriptions: list[dict]) -> None:
+    path = _push_subscriptions_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        _json_lib.dump(subscriptions, f, ensure_ascii=False, indent=2)
+
+
+def _sse(event: str, data: dict) -> str:
+    payload = _json_lib.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n"
 
 
 def _get_auth_file() -> str:
@@ -1322,6 +1352,189 @@ async def dream() -> str:
     final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
+
+
+# =============================================================
+# PWA API bridge — REST commands + SSE events
+# PWA API 桥：REST 命令 + SSE 事件
+# =============================================================
+async def _build_startup_context_events() -> tuple[dict, list[dict]]:
+    """
+    Run the startup context chain and return both aggregate context and SSE events.
+    Chain: core() → breath() → dream() → breath(domain="feel").
+    """
+    context = {}
+    events = []
+
+    async def run_stage(key: str, event_name: str, label: str, call):
+        events.append({"event": "context", "data": {"stage": key, "status": "started"}})
+        try:
+            text = await call()
+            context[key] = text
+            events.append({
+                "event": event_name,
+                "data": {
+                    "stage": key,
+                    "status": "done",
+                    "chars": len(text),
+                    "label": label,
+                },
+            })
+        except Exception as e:
+            message = str(e)
+            context[key] = message
+            events.append({
+                "event": "error",
+                "data": {"stage": key, "status": "error", "error": message},
+            })
+
+    await run_stage("core", "core_done", "Core layer", lambda: core(max_tokens=4000))
+    await run_stage("breath", "breath_done", "Breath", lambda: breath())
+    await run_stage("dream", "dream_done", "Dream", dream)
+    await run_stage("feel", "feel_done", "Feel", lambda: breath(domain="feel"))
+    return context, events
+
+
+@mcp.custom_route("/api/context/startup", methods=["GET"])
+async def api_context_startup(request):
+    """Run startup context chain for the PWA."""
+    from starlette.responses import JSONResponse
+    context, events = await _build_startup_context_events()
+    return JSONResponse({"context": context, "events": events})
+
+
+@mcp.custom_route("/api/chat", methods=["POST"])
+async def api_chat_create(request):
+    """
+    Accept a user chat message and create an SSE event stream.
+    First A0 version streams context assembly; model response generation is added later.
+    """
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    message = str(body.get("message", "")).strip()
+    persona = str(body.get("persona", "elroy-default")).strip() or "elroy-default"
+    if not message:
+        return JSONResponse({"error": "message is required"}, status_code=400)
+
+    conversation_id = secrets.token_urlsafe(16)
+    context, startup_events = await _build_startup_context_events()
+    events = [
+        {
+            "event": "message_received",
+            "data": {
+                "conversation_id": conversation_id,
+                "persona": persona,
+                "chars": len(message),
+            },
+        },
+        *startup_events,
+        {
+            "event": "done",
+            "data": {
+                "conversation_id": conversation_id,
+                "status": "context_ready",
+                "assistant_response": None,
+            },
+        },
+    ]
+    _chat_sessions[conversation_id] = events
+    return JSONResponse({
+        "conversation_id": conversation_id,
+        "event_stream": f"/api/chat/{conversation_id}/events",
+        "status": "context_ready",
+        "context": context,
+    })
+
+
+@mcp.custom_route("/api/chat/{conversation_id}/events", methods=["GET"])
+async def api_chat_events(request):
+    """Stream stored chat events as Server-Sent Events."""
+    from starlette.responses import StreamingResponse
+    conversation_id = request.path_params["conversation_id"]
+    events = _chat_sessions.get(conversation_id)
+    if events is None:
+        async def missing():
+            yield _sse("error", {"error": "conversation not found"})
+        return StreamingResponse(missing(), media_type="text/event-stream", status_code=404)
+
+    async def event_stream():
+        for item in events:
+            yield _sse(item["event"], item["data"])
+            await asyncio.sleep(0)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@mcp.custom_route("/api/dreams", methods=["GET"])
+async def api_dreams(request):
+    """List stored dream reflections for the PWA Dream Log."""
+    from starlette.responses import JSONResponse
+    try:
+        limit = int(request.query_params.get("limit", "20"))
+    except ValueError:
+        limit = 20
+    influence_type = request.query_params.get("influence_type") or None
+    reflections = await bucket_mgr.list_dream_reflections(
+        limit=max(1, min(limit, 100)),
+        influence_type=influence_type,
+    )
+    result = []
+    for reflection in reflections:
+        meta = reflection.get("metadata", {})
+        result.append({
+            "id": reflection["id"],
+            "content": strip_wikilinks(reflection.get("content", "")),
+            "influence_type": meta.get("influence_type"),
+            "source_bucket_ids": meta.get("source_bucket_ids", []),
+            "valence": meta.get("valence", 0.5),
+            "arousal": meta.get("arousal", 0.3),
+            "created": meta.get("created", ""),
+            "name": meta.get("name", reflection["id"]),
+        })
+    return JSONResponse(result)
+
+
+@mcp.custom_route("/api/push/subscribe", methods=["POST"])
+async def api_push_subscribe(request):
+    """Store a browser Push API subscription for later awakening messages."""
+    from starlette.responses import JSONResponse
+    try:
+        subscription = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    endpoint = subscription.get("endpoint") if isinstance(subscription, dict) else None
+    if not endpoint:
+        return JSONResponse({"error": "subscription.endpoint is required"}, status_code=400)
+
+    subscriptions = _load_push_subscriptions()
+    subscriptions = [s for s in subscriptions if s.get("endpoint") != endpoint]
+    subscription["created_at"] = time.time()
+    subscriptions.append(subscription)
+    _save_push_subscriptions(subscriptions)
+    return JSONResponse({"ok": True, "subscriptions": len(subscriptions)})
+
+
+@mcp.custom_route("/api/push/test", methods=["POST"])
+async def api_push_test(request):
+    """
+    Validate the push API shape.
+    Actual Web Push sending is wired in C after VAPID configuration is present.
+    """
+    from starlette.responses import JSONResponse
+    subscriptions = _load_push_subscriptions()
+    if not subscriptions:
+        return JSONResponse({"ok": False, "error": "no push subscriptions"}, status_code=400)
+    return JSONResponse({
+        "ok": True,
+        "queued": False,
+        "subscriptions": len(subscriptions),
+        "reason": "web_push_sender_not_configured",
+    })
 
 
 # =============================================================
