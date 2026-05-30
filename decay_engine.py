@@ -19,6 +19,8 @@
 # 被谁依赖：server.py
 # ============================================================
 
+from __future__ import annotations
+
 import math
 import asyncio
 import logging

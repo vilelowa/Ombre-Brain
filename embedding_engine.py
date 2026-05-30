@@ -11,6 +11,8 @@
 # 被谁依赖：server.py, bucket_manager.py
 # ============================================================
 
+from __future__ import annotations
+
 import os
 import json
 import math
