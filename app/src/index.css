@@ -1,0 +1,59 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: #faf9f7;
+  --color-surface: #faf9f7;
+  --color-surface-bright: #faf9f7;
+  --color-surface-dim: #dadad8;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-low: #f4f3f1;
+  --color-surface-container: #efeeec;
+  --color-surface-container-high: #e9e8e6;
+  --color-surface-container-highest: #e3e2e0;
+  
+  --color-on-surface: #1a1c1b;
+  --color-on-surface-variant: #404849;
+  --color-inverse-surface: #2f3130;
+  --color-inverse-on-surface: #f1f1ef;
+  
+  --color-outline: #707979;
+  --color-outline-variant: #c0c8c8;
+  
+  --color-primary: #366366;
+  --color-primary-container: #4f7c7f;
+  --color-on-primary: #ffffff;
+  --color-primary-fixed: #bcebee;
+  --color-primary-fixed-dim: #a0cfd2;
+  
+  --color-secondary: #825152;
+  --color-secondary-container: #ffbfbf;
+  --color-on-secondary: #ffffff;
+  --color-secondary-fixed: #ffdad9;
+  
+  --color-tertiary: #7f5211;
+  --color-tertiary-container: #9c6a29;
+  --color-on-tertiary: #ffffff;
+  --color-tertiary-fixed: #ffddb8;
+  --color-tertiary-fixed-dim: #f8bb71;
+  
+  --color-charcoal: #333333;
+  --color-muted-gray: #8e8e8e;
+  --color-unresolved-violet: #8e8ea5;
+  --color-border-hairline: #e5e3df;
+
+  --font-sans: "Hanken Grotesk", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+}
+
+body {
+  background-color: var(--color-background);
+  color: var(--color-charcoal);
+  font-family: var(--font-sans);
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Hide scrollbar for a cleaner instrument look */
+::-webkit-scrollbar {
+  width: 0px;
+  background: transparent;
+}
