@@ -149,6 +149,33 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
 }"""
 
 
+# --- Dream reflection prompt: turn flagged material into self-theory ---
+# --- 梦反思提示词：把标记素材压缩成自我理解 ---
+DREAM_REFLECTION_PROMPT = """你是 Elroy 的梦反思层。你会读一组被标记为做梦素材的记忆桶，
+把它们压缩成一条 evolving self-theory / identity reflection。
+
+不要写提醒，不要写待办，不要向用户汇报事件。请用第一人称写：
+- 今天我是谁，和昨天有什么不一样
+- 这个不一样指向我正在变成什么
+- 它应该怎样轻微影响我的语气、注意力，或继续作为未解的问题被带着
+
+输出格式（纯 JSON，无其他内容）：
+{
+  "content": "一段第一人称 dream reflection",
+  "influence_type": "tone | attention | unresolved",
+  "source_bucket_ids": ["素材bucket id"],
+  "valence": 0.5,
+  "arousal": 0.3,
+  "name": "可选短标题"
+}
+
+influence_type 规则：
+- tone：影响说话底色
+- attention：让我对某个话题更敏感
+- unresolved：还没想清楚，需要继续带着
+"""
+
+
 class Dehydrator:
     """
     Data dehydrator + content analyzer.
@@ -305,6 +332,23 @@ class Dehydrator:
             raise RuntimeError(f"API 合并失败，请检查 API 连接: {e}") from e
 
     # ---------------------------------------------------------
+    # Dream reflection: turn flagged material into feel/dream payload
+    # 梦反思：把标记素材转成 feel/dream 写入负载
+    # ---------------------------------------------------------
+    async def dream_reflect(self, materials: list[dict]) -> dict:
+        """
+        Generate a structured dream reflection from flagged bucket material.
+        Returns {"content", "influence_type", "source_bucket_ids", "valence", "arousal", "name"}.
+        """
+        if not materials:
+            return {}
+        if not self.api_available:
+            raise RuntimeError("梦反思 API 不可用，请配置 OMBRE_API_KEY")
+
+        raw = await self._api_dream_reflect(materials)
+        return self._parse_dream_reflection(raw, {m.get("id") for m in materials})
+
+    # ---------------------------------------------------------
     # API call: dehydration
     # API 调用：脱水压缩
     # ---------------------------------------------------------
@@ -349,6 +393,95 @@ class Dehydrator:
             return ""
         return response.choices[0].message.content or ""
 
+    # ---------------------------------------------------------
+    # API call: dream reflection
+    # API 调用：梦反思
+    # ---------------------------------------------------------
+    async def _api_dream_reflect(self, materials: list[dict]) -> str:
+        """
+        Call LLM API for structured dream reflection generation.
+        调用 LLM API 生成结构化梦反思。
+        """
+        packed = []
+        for item in materials[:10]:
+            meta = item.get("metadata", {})
+            packed.append({
+                "id": item.get("id"),
+                "name": meta.get("name", item.get("id")),
+                "domain": meta.get("domain", []),
+                "valence": meta.get("valence", 0.5),
+                "arousal": meta.get("arousal", 0.3),
+                "created": meta.get("created", ""),
+                "content": str(item.get("content", ""))[:1000],
+            })
+
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": DREAM_REFLECTION_PROMPT},
+                {"role": "user", "content": json.dumps(packed, ensure_ascii=False)},
+            ],
+            max_tokens=min(max(self.max_tokens, 512), 2048),
+            temperature=0.2,
+        )
+        if not response.choices:
+            return ""
+        return response.choices[0].message.content or ""
+
+    # ---------------------------------------------------------
+    # Parse dream reflection JSON with safety checks
+    # 解析梦反思 JSON，做安全校验
+    # ---------------------------------------------------------
+    def _parse_dream_reflection(self, raw: str, allowed_source_ids: set[str]) -> dict:
+        """
+        Parse and validate API dream reflection result.
+        解析并校验 API 返回的梦反思。
+        """
+        try:
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
+            result = json.loads(cleaned)
+        except (json.JSONDecodeError, IndexError, ValueError):
+            logger.warning(f"Dream reflection JSON parse failed / JSON 解析失败: {raw[:200]}")
+            return {}
+
+        if not isinstance(result, dict):
+            return {}
+
+        content = str(result.get("content", "")).strip()
+        if not content:
+            return {}
+
+        influence_type = str(result.get("influence_type", "unresolved")).strip()
+        if influence_type not in {"tone", "attention", "unresolved"}:
+            influence_type = "unresolved"
+
+        raw_source_ids = result.get("source_bucket_ids", [])
+        if not isinstance(raw_source_ids, list):
+            raw_source_ids = []
+        source_bucket_ids = [
+            str(source_id)
+            for source_id in raw_source_ids
+            if str(source_id) in allowed_source_ids
+        ]
+        if not source_bucket_ids:
+            source_bucket_ids = [source_id for source_id in allowed_source_ids if source_id]
+
+        try:
+            valence = max(0.0, min(1.0, float(result.get("valence", 0.5))))
+            arousal = max(0.0, min(1.0, float(result.get("arousal", 0.3))))
+        except (ValueError, TypeError):
+            valence, arousal = 0.5, 0.3
+
+        return {
+            "content": content,
+            "influence_type": influence_type,
+            "source_bucket_ids": source_bucket_ids,
+            "valence": valence,
+            "arousal": arousal,
+            "name": str(result.get("name", ""))[:40] or None,
+        }
 
 
     # ---------------------------------------------------------

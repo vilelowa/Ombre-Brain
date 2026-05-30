@@ -1166,7 +1166,7 @@ async def pulse(include_archive: bool = False) -> str:
 # =============================================================
 @mcp.tool()
 async def dream() -> str:
-    """做梦——读取最近新增的记忆桶,供你自省。读完后可以trace(resolved=1)放下,或hold(feel=True)写感受。"""
+    """做梦——优先把已标记素材生成 dream reflection；无标记时返回最近记忆供自省。"""
     await decay_engine.ensure_started()
 
     try:
@@ -1196,6 +1196,38 @@ async def dream() -> str:
 
     if not recent:
         return "没有需要消化的新记忆。"
+
+    # --- LLM-backed dream generation for flagged material ---
+    # --- 对已标记素材执行 LLM 梦反思生成 ---
+    if flagged:
+        try:
+            reflection = await dehydrator.dream_reflect(recent)
+            if not reflection:
+                return "Dreaming 没有生成可写入的反思，已保留素材标记。"
+
+            reflection_id = await bucket_mgr.create_dream_reflection(
+                content=reflection["content"],
+                influence_type=reflection["influence_type"],
+                source_bucket_ids=reflection["source_bucket_ids"],
+                valence=reflection.get("valence", 0.5),
+                arousal=reflection.get("arousal", 0.3),
+                name=reflection.get("name"),
+            )
+            for b in recent:
+                await bucket_mgr.update(b["id"], dream_candidate=False)
+
+            source_ids = ", ".join(reflection["source_bucket_ids"])
+            return (
+                "=== Dreaming ===\n"
+                "已从已标记的做梦素材生成 dream reflection。\n"
+                f"influence_type: {reflection['influence_type']}\n"
+                f"source_bucket_ids: {source_ids}\n"
+                f"reflection_bucket_id: {reflection_id}\n"
+                f"{reflection['content']}"
+            )
+        except Exception as e:
+            logger.error(f"Dream reflection generation failed: {e}")
+            return f"Dreaming 生成失败，已保留素材标记: {e}"
 
     parts = []
     for b in recent:
