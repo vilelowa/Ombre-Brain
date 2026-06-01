@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { ChevronDown, ChevronUp, Play } from 'lucide-react';
+import { api } from '../lib/api';
 
 export default function Settings() {
   const [autoReconnect, setAutoReconnect] = useState(true);
@@ -29,7 +30,7 @@ export default function Settings() {
           <div className="flex flex-col gap-6">
             <div className="flex justify-between items-center">
               <span className="font-sans text-[14px] text-charcoal">Backend URL</span>
-              <span className="font-mono text-[12px] bg-surface-container text-primary px-2 py-1 rounded-[4px]">wss://api.elroy.app/v1</span>
+              <span className="font-mono text-[12px] bg-surface-container text-primary px-2 py-1 rounded-[4px]">{api.baseUrl}</span>
             </div>
 
             <div className="flex justify-between items-center">

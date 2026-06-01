@@ -1,8 +1,14 @@
 import {
+  AwakeningConfigureResponse,
+  AwakeningLogEntry,
+  AwakeningSchedulerConfig,
+  AwakeningStatus,
+  AwakeningTriggerResponse,
   ChatCreateResponse,
   ChatEvent,
   Dream,
   Message,
+  PrivateDiaryEntry,
   StartupContext,
   StartupContextResponse,
 } from '../types';
@@ -71,6 +77,10 @@ function eventSourceUrl(path: string): string {
 }
 
 class ApiService {
+  get baseUrl(): string {
+    return API_BASE_URL || window.location.origin;
+  }
+
   /* GET /api/context/startup */
   async getStartupContext(): Promise<StartupContext> {
     await this.getStartupContextDetails();
@@ -183,6 +193,56 @@ class ApiService {
       headers: {'Content-Type': 'application/json'},
     });
     return readJson<PushTestResponse>(response);
+  }
+
+  /* GET /api/push/public-key */
+  async getPushPublicKey(): Promise<{ public_key: string }> {
+    const response = await fetch(apiUrl('/api/push/public-key'));
+    return readJson<{ public_key: string }>(response);
+  }
+
+  /* GET /api/awakening/status */
+  async getAwakeningStatus(): Promise<AwakeningStatus> {
+    const response = await fetch(apiUrl('/api/awakening/status'));
+    return readJson<AwakeningStatus>(response);
+  }
+
+  /* GET /api/awakening/log */
+  async getAwakeningLog(limit = 12): Promise<AwakeningLogEntry[]> {
+    const response = await fetch(apiUrl(`/api/awakening/log?limit=${encodeURIComponent(limit)}`));
+    return readJson<AwakeningLogEntry[]>(response);
+  }
+
+  /* POST /api/awakening/trigger */
+  async triggerAwakening(): Promise<AwakeningTriggerResponse> {
+    const response = await fetch(apiUrl('/api/awakening/trigger'), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+    });
+    return readJson<AwakeningTriggerResponse>(response);
+  }
+
+  /* POST /api/awakening/configure */
+  async configureAwakening(
+    scheduler: Partial<AwakeningSchedulerConfig>,
+    persist = false,
+  ): Promise<AwakeningConfigureResponse> {
+    const response = await fetch(apiUrl('/api/awakening/configure'), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({scheduler, persist}),
+    });
+    return readJson<AwakeningConfigureResponse>(response);
+  }
+
+  /* GET /api/private-diary */
+  async getPrivateDiary(limit = 20, includeLocked = true): Promise<PrivateDiaryEntry[]> {
+    const params = new URLSearchParams({
+      limit: String(limit),
+      include_locked: String(includeLocked),
+    });
+    const response = await fetch(apiUrl(`/api/private-diary?${params.toString()}`));
+    return readJson<PrivateDiaryEntry[]>(response);
   }
 }
 

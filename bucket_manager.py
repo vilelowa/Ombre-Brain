@@ -59,6 +59,7 @@ class BucketManager:
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
         self.feel_dir = os.path.join(self.base_dir, "feel")
+        self.private_dir = os.path.join(self.feel_dir, "private")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
 
@@ -290,6 +291,109 @@ class BucketManager:
                     )
 
         return deleted
+
+    # ---------------------------------------------------------
+    # Create a private diary entry (feel/private/)
+    # 创建私密日记条目
+    # ---------------------------------------------------------
+    async def create_private_entry(
+        self,
+        content: str,
+        locked_days: int = 0,
+        name: str = None,
+        valence: float = 0.5,
+        arousal: float = 0.3,
+    ) -> str:
+        """
+        Store a private diary entry under feel/private/.
+        Optional time-lock (max 7 days) — Ciel can see after lock expires.
+        存储私密日记到 feel/private/，可选时间锁（最多 7 天）。
+        """
+        locked_days = max(0, min(7, int(locked_days)))
+        bucket_id = generate_bucket_id()
+        bucket_name = sanitize_name(name) if name else bucket_id
+
+        locked_until = None
+        if locked_days > 0:
+            from datetime import timedelta
+            locked_until = (datetime.now() + timedelta(days=locked_days)).isoformat()
+
+        metadata = {
+            "id": bucket_id,
+            "name": bucket_name,
+            "tags": [],
+            "domain": [],
+            "valence": max(0.0, min(1.0, valence)),
+            "arousal": max(0.0, min(1.0, arousal)),
+            "importance": 5,
+            "type": "feel",
+            "private": True,
+            "created": now_iso(),
+            "last_active": now_iso(),
+            "activation_count": 0,
+        }
+        if locked_until:
+            metadata["locked_until"] = locked_until
+
+        post = frontmatter.Post(content, **metadata)
+
+        os.makedirs(self.private_dir, exist_ok=True)
+        if bucket_name and bucket_name != bucket_id:
+            filename = f"{bucket_name}_{bucket_id}.md"
+        else:
+            filename = f"{bucket_id}.md"
+        file_path = safe_path(self.private_dir, filename)
+
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+        except OSError as e:
+            logger.error(f"Failed to write private entry / 写入私密日记失败: {file_path}: {e}")
+            raise
+
+        lock_info = f" locked={locked_days}d" if locked_days else ""
+        logger.info(f"Created private entry / 创建私密日记: {bucket_id}{lock_info}")
+        return bucket_id
+
+    async def list_private_entries(
+        self,
+        include_locked: bool = False,
+        limit: int = 20,
+    ) -> list[dict]:
+        """
+        Return private diary entries from feel/private/.
+        By default, skips entries still within their time-lock.
+        返回 feel/private/ 的日记条目。默认跳过仍在时间锁内的条目。
+        """
+        entries = []
+        if not os.path.exists(self.private_dir):
+            return entries
+
+        now = datetime.now()
+        for root, _, files in os.walk(self.private_dir):
+            for filename in files:
+                if not filename.endswith(".md"):
+                    continue
+                entry = self._load_bucket(os.path.join(root, filename))
+                if not entry:
+                    continue
+                meta = entry.get("metadata", {})
+
+                # Check time-lock
+                if not include_locked:
+                    locked_until_str = meta.get("locked_until")
+                    if locked_until_str:
+                        try:
+                            locked_until = datetime.fromisoformat(str(locked_until_str))
+                            if now < locked_until:
+                                continue  # Still locked
+                        except (ValueError, TypeError):
+                            pass
+
+                entries.append(entry)
+
+        entries.sort(key=lambda e: e["metadata"].get("created", ""), reverse=True)
+        return entries[:limit]
 
     # ---------------------------------------------------------
     # Read bucket content

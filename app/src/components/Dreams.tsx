@@ -13,6 +13,23 @@ export default function Dreams() {
 
   const filteredDreams = dreams.filter(d => filter === 'all' || d.influenceType === filter);
 
+  const formatDate = (dateStr: string) => {
+    try {
+      if (!dateStr) return 'Unknown Date';
+      const d = new Date(dateStr);
+      if (isNaN(d.getTime())) return 'Unknown Date';
+      return new Intl.DateTimeFormat('en-US', {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      }).format(d);
+    } catch (e) {
+      return 'Unknown Date';
+    }
+  };
+
   return (
     <div className="flex flex-col h-full bg-background relative pt-14 px-4 overflow-y-auto">
       {/* Top Header */}
@@ -62,7 +79,7 @@ export default function Dreams() {
                     {dream.influenceType}
                   </span>
                   <span className="font-mono text-[12px] text-muted-gray">
-                     {new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false}).format(new Date(dream.createdAt))}
+                     {formatDate(dream.createdAt)}
                   </span>
                 </div>
               </div>

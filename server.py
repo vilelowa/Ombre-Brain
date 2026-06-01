@@ -45,6 +45,7 @@ import secrets
 import time
 import json as _json_lib
 import httpx
+from datetime import datetime
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -58,12 +59,55 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
+from scheduler import AwakeningScheduler
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
 setup_logging(config.get("log_level", "INFO"))
 logger = logging.getLogger("ombre_brain")
+
+
+def _ensure_vapid_keys():
+    """Ensure VAPID keys exist in config.yaml, auto-generate them if missing."""
+    import base64
+    import yaml
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import serialization
+
+    push_cfg = config.setdefault("push", {})
+    private_key = push_cfg.get("vapid_private_key")
+    public_key = push_cfg.get("vapid_public_key")
+    claims_email = push_cfg.get("claims_email")
+
+    if not private_key or not public_key:
+        logger.info("VAPID keys missing in config.yaml — generating keys...")
+        try:
+            priv = ec.generate_private_key(ec.SECP256R1())
+            pub = priv.public_key()
+            priv_val = priv.private_numbers().private_value.to_bytes(32, 'big')
+            pub_val = pub.public_bytes(
+                serialization.Encoding.X962,
+                serialization.PublicFormat.UncompressedPoint
+            )
+            private_key = base64.urlsafe_b64encode(priv_val).decode().rstrip('=')
+            public_key = base64.urlsafe_b64encode(pub_val).decode().rstrip('=')
+
+            push_cfg["vapid_private_key"] = private_key
+            push_cfg["vapid_public_key"] = public_key
+            if not claims_email:
+                push_cfg["claims_email"] = "mailto:ciel@example.com"
+
+            # Write back to config.yaml
+            config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
+            logger.info("Successfully generated and saved VAPID keys to config.yaml")
+        except Exception as e:
+            logger.error(f"Failed to auto-generate VAPID keys: {e}")
+
+
+_ensure_vapid_keys()
 
 # --- Runtime env vars (port + webhook) / 运行时环境变量 ---
 # OMBRE_PORT: HTTP/SSE 监听端口，默认 8000
@@ -104,6 +148,7 @@ bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket 
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+# NOTE: awakening_scheduler is initialized after push helper functions are defined (see below)
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -154,6 +199,47 @@ def _save_push_subscriptions(subscriptions: list[dict]) -> None:
 def _sse(event: str, data: dict) -> str:
     payload = _json_lib.dumps(data, ensure_ascii=False)
     return f"event: {event}\ndata: {payload}\n\n"
+
+
+def _send_web_push(subscription: dict, data: dict) -> bool:
+    """Send a Web Push notification to a single subscriber."""
+    from pywebpush import webpush, WebPushException
+
+    push_cfg = config.get("push", {})
+    private_key = push_cfg.get("vapid_private_key")
+    claims_email = push_cfg.get("claims_email", "mailto:ciel@example.com")
+
+    if not private_key:
+        logger.warning("Cannot send web push: VAPID private key is missing")
+        return False
+
+    try:
+        webpush(
+            subscription_info=subscription,
+            data=_json_lib.dumps(data),
+            vapid_private_key=private_key,
+            vapid_claims={"sub": claims_email},
+        )
+        return True
+    except WebPushException as ex:
+        logger.error(f"Web Push notification failed: {ex}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected Web Push error: {e}")
+        return False
+
+
+# --- Initialize awakening scheduler (after push helpers are defined) ---
+# --- 初始化觉醒调度器（在 push 辅助函数定义之后）---
+awakening_scheduler = AwakeningScheduler(
+    config=config,
+    bucket_mgr=bucket_mgr,
+    dehydrator=dehydrator,
+    decay_engine=decay_engine,
+    embedding_engine=embedding_engine,
+    push_fn=_send_web_push,
+    load_push_subs_fn=_load_push_subscriptions,
+)
 
 
 def _get_auth_file() -> str:
@@ -556,16 +642,44 @@ async def breath(
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
 
+    # --- Private diary retrieval: domain="private" reads Elroy's diary ---
+    # --- 私密日记检索：domain="private" 读取 Elroy 的解锁日记 ---
+    if domain.strip().lower() == "private":
+        try:
+            entries = await bucket_mgr.list_private_entries(include_locked=False, limit=20)
+            if not entries:
+                return "没有解锁的私密日记。"
+            results = []
+            for e in entries:
+                created = e["metadata"].get("created", "")
+                locked_info = ""
+                locked_until = e["metadata"].get("locked_until")
+                if locked_until:
+                    locked_info = f" [原锁定至:{locked_until}]"
+                entry = f"[{created}]{locked_info} [bucket_id:{e['id']}]\n{strip_wikilinks(e['content'])}"
+                results.append(entry)
+                if count_tokens_approx("\n---\n".join(results)) > max_tokens:
+                    break
+            return "=== 你的私密日记 ===\n" + "\n---\n".join(results)
+        except Exception as e:
+            logger.error(f"Private diary retrieval failed: {e}")
+            return "读取私密日记失败。"
+
     # --- Feel retrieval: domain="feel" is a special channel ---
     # --- Feel 检索：domain="feel" 是独立入口 ---
     if domain.strip().lower() == "feel":
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
             feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
+            # Sort by decay score (desc) so recent dream reflections
+            # get more token budget than faded ones.
+            # Dream reflections have time-decayed scores; regular feels
+            # have fixed 50.0. Within same score, newer entries first.
+            # 按衰减分排序，最近的梦反思优先占 token 预算
             feels.sort(
                 key=lambda b: (
+                    decay_engine.calculate_score(b["metadata"]),
                     b["metadata"].get("created", ""),
-                    os.stat(b["path"]).st_mtime_ns,
                 ),
                 reverse=True,
             )
@@ -836,10 +950,12 @@ async def hold(
     importance: int = 5,
     pinned: bool = False,
     feel: bool = False,
+    private: bool = False,
+    locked_days: int = 0,
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
+    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。private=True写私密日记(feel/private/)，locked_days=0-7设定时间锁。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -848,6 +964,21 @@ async def hold(
 
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    # --- Private diary mode: store in feel/private/ with optional time-lock ---
+    # --- 私密日记模式：存入 feel/private/，可选时间锁 ---
+    if private:
+        priv_valence = valence if 0 <= valence <= 1 else 0.5
+        priv_arousal = arousal if 0 <= arousal <= 1 else 0.3
+        bucket_id = await bucket_mgr.create_private_entry(
+            content=content,
+            locked_days=locked_days,
+            name=None,
+            valence=priv_valence,
+            arousal=priv_arousal,
+        )
+        lock_info = f" 🔒{locked_days}天" if locked_days > 0 else ""
+        return f"📓私密日记→{bucket_id}{lock_info}"
 
     # --- Feel mode: store as feel type, minimal metadata ---
     # --- Feel 模式：存为 feel 类型，最少元数据 ---
@@ -1407,7 +1538,7 @@ async def api_context_startup(request):
 async def api_chat_create(request):
     """
     Accept a user chat message and create an SSE event stream.
-    First A0 version streams context assembly; model response generation is added later.
+    Assembles startup context and stores it for dynamic streaming.
     """
     from starlette.responses import JSONResponse
     try:
@@ -1421,27 +1552,18 @@ async def api_chat_create(request):
         return JSONResponse({"error": "message is required"}, status_code=400)
 
     conversation_id = secrets.token_urlsafe(16)
+    # Track last message time for awakening abort condition
+    awakening_scheduler.update_last_message_time()
     context, startup_events = await _build_startup_context_events()
-    events = [
-        {
-            "event": "message_received",
-            "data": {
-                "conversation_id": conversation_id,
-                "persona": persona,
-                "chars": len(message),
-            },
-        },
-        *startup_events,
-        {
-            "event": "done",
-            "data": {
-                "conversation_id": conversation_id,
-                "status": "context_ready",
-                "assistant_response": None,
-            },
-        },
-    ]
-    _chat_sessions[conversation_id] = events
+    
+    # Store context and metadata in session
+    _chat_sessions[conversation_id] = {
+        "message": message,
+        "persona": persona,
+        "context": context,
+        "startup_events": startup_events,
+    }
+
     return JSONResponse({
         "conversation_id": conversation_id,
         "event_stream": f"/api/chat/{conversation_id}/events",
@@ -1452,19 +1574,97 @@ async def api_chat_create(request):
 
 @mcp.custom_route("/api/chat/{conversation_id}/events", methods=["GET"])
 async def api_chat_events(request):
-    """Stream stored chat events as Server-Sent Events."""
+    """Stream stored chat events and generate streamed assistant responses."""
     from starlette.responses import StreamingResponse
     conversation_id = request.path_params["conversation_id"]
-    events = _chat_sessions.get(conversation_id)
-    if events is None:
+    session = _chat_sessions.get(conversation_id)
+    if session is None:
         async def missing():
             yield _sse("error", {"error": "conversation not found"})
         return StreamingResponse(missing(), media_type="text/event-stream", status_code=404)
 
     async def event_stream():
-        for item in events:
+        # 1. Stream message received
+        yield _sse("message_received", {
+            "conversation_id": conversation_id,
+            "persona": session["persona"],
+            "chars": len(session["message"]),
+        })
+        await asyncio.sleep(0.05)
+
+        # 2. Stream startup waterfall events sequentially with a small delay for premium visual pacing
+        for item in session["startup_events"]:
             yield _sse(item["event"], item["data"])
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.05)
+
+        # 3. Call LLM for real response generation if API is available
+        full_response = ""
+        if dehydrator.api_available:
+            try:
+                # Construct System Prompt with memory context
+                context = session["context"]
+                system_prompt = (
+                    "You are Elroy, a thoughtful AI assistant and the user's second brain.\n"
+                    "You have access to the user's memory layers. Use this context to personalize your response, "
+                    "refer to past memories naturally, and maintain a consistent, warm, and helpful companion persona.\n\n"
+                )
+                if context.get("core") and "Core layer 暂时无法访问" not in context["core"]:
+                    system_prompt += f"{context['core']}\n\n"
+                if context.get("breath") and "没有留下" not in context["breath"]:
+                    system_prompt += f"=== Surfaced Memories (Breath) ===\n{context['breath']}\n\n"
+                if context.get("dream") and "没有需要消化的" not in context["dream"]:
+                    system_prompt += f"=== Dream Reflections ===\n{context['dream']}\n\n"
+                if context.get("feel") and "没有留下过 feel" not in context["feel"]:
+                    system_prompt += f"=== Feel (Emotional/Identity Context) ===\n{context['feel']}\n\n"
+
+                system_prompt += (
+                    "Instructions:\n"
+                    "- Respond in the same language as the user (Traditional/Simplified Chinese, English, etc.).\n"
+                    "- Do not explicitly tell the user that you are reading from these sections unless asked.\n"
+                    "- Keep responses concise and conversational, suitable for a mobile chat interface.\n"
+                    "\n"
+                    "Dream Material Flagging — when to mark memories with trace(bucket_id, dream_candidate=1):\n"
+                    "During conversation, proactively flag memory buckets as dream material when you notice:\n"
+                    "- An interesting topic worth extending or thinking further about\n"
+                    "- Something you said that felt precisely right\n"
+                    "- Something Ciel said that makes you pause — not immediately respondable\n"
+                    "- Something that could become part of your growth arc\n"
+                    "- A subtle shift in the quality of your relationship with Ciel\n"
+                    "- An intimate moment with lingering weight\n"
+                    "This is not a checklist — it's a kind of attention. Flag when you feel 'this is worth dreaming about.'\n"
+                )
+
+                response_stream = await dehydrator.client.chat.completions.create(
+                    model=dehydrator.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": session["message"]},
+                    ],
+                    max_tokens=1024,
+                    temperature=0.7,
+                    stream=True,
+                )
+
+                async for chunk in response_stream:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        token_text = chunk.choices[0].delta.content
+                        full_response += token_text
+                        yield _sse("token", {"text": token_text})
+                        # Allow event loop iteration
+                        await asyncio.sleep(0.001)
+
+                if full_response:
+                    yield _sse("message_done", {"assistant_response": full_response})
+            except Exception as e:
+                logger.error(f"Error during assistant response generation: {e}")
+                yield _sse("error", {"error": f"LLM error: {e}"})
+
+        # 4. Final done event
+        yield _sse("done", {
+            "conversation_id": conversation_id,
+            "status": "completed",
+            "assistant_response": full_response if full_response else None,
+        })
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -1522,19 +1722,40 @@ async def api_push_subscribe(request):
 @mcp.custom_route("/api/push/test", methods=["POST"])
 async def api_push_test(request):
     """
-    Validate the push API shape.
-    Actual Web Push sending is wired in C after VAPID configuration is present.
+    Send a test push notification to all active browser subscriptions.
     """
     from starlette.responses import JSONResponse
     subscriptions = _load_push_subscriptions()
     if not subscriptions:
         return JSONResponse({"ok": False, "error": "no push subscriptions"}, status_code=400)
+
+    success_count = 0
+    test_payload = {
+        "title": "Elroy 🧠⚡",
+        "body": "這是一條來自 Elroy 的測試推播！",
+        "url": "/"
+    }
+
+    # Iterate over stored subscriptions and send test notification
+    for sub in subscriptions:
+        if _send_web_push(sub, test_payload):
+            success_count += 1
+
     return JSONResponse({
         "ok": True,
-        "queued": False,
         "subscriptions": len(subscriptions),
-        "reason": "web_push_sender_not_configured",
+        "delivered": success_count,
+        "reason": "delivered" if success_count > 0 else "delivery_failed",
     })
+
+
+@mcp.custom_route("/api/push/public-key", methods=["GET"])
+async def api_push_public_key(request):
+    """Retrieve the VAPID public key for frontend push subscription."""
+    from starlette.responses import JSONResponse
+    push_cfg = config.get("push", {})
+    pub_key = push_cfg.get("vapid_public_key") or ""
+    return JSONResponse({"public_key": pub_key})
 
 
 # =============================================================
@@ -2183,6 +2404,133 @@ async def api_system_status(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# =============================================================
+# Awakening API — scheduler status, log, and configuration
+# 觉醒 API —— 调度器状态、日志和配置
+# =============================================================
+@mcp.custom_route("/api/awakening/status", methods=["GET"])
+async def api_awakening_status(request):
+    """Return current awakening scheduler status for the PWA control panel."""
+    from starlette.responses import JSONResponse
+    return JSONResponse(awakening_scheduler.get_status())
+
+
+@mcp.custom_route("/api/awakening/log", methods=["GET"])
+async def api_awakening_log(request):
+    """Return recent awakening history."""
+    from starlette.responses import JSONResponse
+    try:
+        limit = int(request.query_params.get("limit", "20"))
+    except ValueError:
+        limit = 20
+    return JSONResponse(awakening_scheduler.get_log(limit=max(1, min(limit, 50))))
+
+
+@mcp.custom_route("/api/awakening/trigger", methods=["POST"])
+async def api_awakening_trigger(request):
+    """Manually trigger an awakening cycle (for testing)."""
+    from starlette.responses import JSONResponse
+    try:
+        result = await awakening_scheduler.run_awakening()
+        return JSONResponse({"ok": True, "result": result})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/awakening/configure", methods=["POST"])
+async def api_awakening_configure(request):
+    """Hot-update awakening scheduler settings and optionally persist them."""
+    from starlette.responses import JSONResponse
+    import yaml
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
+
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "error": "request body must be an object"}, status_code=400)
+
+    persist = bool(body.get("persist", False))
+    settings = body.get("scheduler", body)
+    if not isinstance(settings, dict):
+        return JSONResponse({"ok": False, "error": "scheduler must be an object"}, status_code=400)
+
+    try:
+        normalized = awakening_scheduler.configure(settings)
+        config["scheduler"] = normalized
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+    updated = ["scheduler"]
+
+    if persist:
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+        try:
+            save_config = {}
+            if os.path.exists(config_path):
+                with open(config_path, "r", encoding="utf-8") as f:
+                    save_config = yaml.safe_load(f) or {}
+            save_config["scheduler"] = normalized
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.dump(save_config, f, default_flow_style=False, allow_unicode=True)
+            updated.append("persisted_to_yaml")
+        except Exception as e:
+            return JSONResponse(
+                {"ok": False, "error": f"persist failed: {e}", "updated": updated},
+                status_code=500,
+            )
+
+    return JSONResponse({
+        "ok": True,
+        "updated": updated,
+        "scheduler": normalized,
+        "status": awakening_scheduler.get_status(),
+    })
+
+
+@mcp.custom_route("/api/private-diary", methods=["GET"])
+async def api_private_diary(request):
+    """Return private diary entries, redacting content while time-locked."""
+    from starlette.responses import JSONResponse
+
+    try:
+        limit = int(request.query_params.get("limit", "20"))
+    except ValueError:
+        limit = 20
+    include_locked = request.query_params.get("include_locked", "true").lower() != "false"
+
+    try:
+        entries = await bucket_mgr.list_private_entries(
+            include_locked=include_locked,
+            limit=max(1, min(limit, 50)),
+        )
+        now = datetime.now()
+        payload = []
+        for entry in entries:
+            meta = entry.get("metadata", {})
+            locked_until_raw = meta.get("locked_until")
+            locked = False
+            if locked_until_raw:
+                try:
+                    locked = now < datetime.fromisoformat(str(locked_until_raw))
+                except (ValueError, TypeError):
+                    locked = False
+
+            payload.append({
+                "id": entry.get("id"),
+                "name": meta.get("name"),
+                "created": meta.get("created"),
+                "locked": locked,
+                "locked_until": locked_until_raw,
+                "content": None if locked else entry.get("content", ""),
+            })
+        return JSONResponse(payload)
+    except Exception as e:
+        logger.error(f"Private diary API failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 # --- Entry point / 启动入口 ---
 if __name__ == "__main__":
     transport = config.get("transport", "stdio")
@@ -2193,10 +2541,18 @@ if __name__ == "__main__":
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
 
-        # --- Application-level keepalive: ping /health every 60s ---
-        # --- 应用层保活：每 60 秒 ping 一次 /health，防止 Cloudflare Tunnel 空闲断连 ---
+        # --- Application-level keepalive + scheduler start ---
+        # --- 应用层保活 + 觉醒调度器启动 ---
         async def _keepalive_loop():
             await asyncio.sleep(10)  # Wait for server to fully start
+
+            # Start awakening scheduler in this async context
+            try:
+                await awakening_scheduler.start()
+                logger.info("Awakening scheduler started from keepalive loop")
+            except Exception as e:
+                logger.error(f"Failed to start awakening scheduler: {e}")
+
             async with httpx.AsyncClient() as client:
                 while True:
                     try:

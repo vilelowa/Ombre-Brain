@@ -10,9 +10,9 @@ export default function Chat() {
   const [isSending, setIsSending] = useState(false);
   const [startupContext, setStartupContext] = useState<StartupContext | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
-    // Simulate connection & fetching context/messages
     const loadData = async () => {
       // Setup initial context states as pending out of the gate
       setStartupContext({ core: 'pending', breath: 'pending', dream: 'pending', feel: 'pending' });
@@ -21,19 +21,47 @@ export default function Chat() {
       const history = await api.getChatEvents('default');
       setMessages(history);
 
-      // Simulate startup waterfall
-      const delays = [500, 1000, 1500, 2000];
-      setTimeout(() => setStartupContext(prev => ({ ...prev!, core: 'done' })), delays[0]);
-      setTimeout(() => setStartupContext(prev => ({ ...prev!, breath: 'done' })), delays[1]);
-      setTimeout(() => setStartupContext(prev => ({ ...prev!, dream: 'running' })), delays[2]);
-      setTimeout(() => setStartupContext(prev => ({ ...prev!, dream: 'done', feel: 'done' })), delays[3]);
-      
-      setTimeout(() => {
-        setStartupContext(null); // hide sequence once complete
-      }, 3500);
+      try {
+        const details = await api.getStartupContextDetails();
+        
+        // Reconstruct startupContext from details.events
+        const updatedContext = { core: 'pending', breath: 'pending', dream: 'pending', feel: 'pending' } as StartupContext;
+        
+        if (details.events && Array.isArray(details.events)) {
+          details.events.forEach((event) => {
+            if (event.event === 'context' && event.data.stage) {
+              updatedContext[event.data.stage] = event.data.status === 'started' ? 'running' : 'pending';
+            } else if (event.event.endsWith('_done')) {
+              const stage = event.event.replace('_done', '') as keyof StartupContext;
+              updatedContext[stage] = 'done';
+            } else if (event.event === 'error' && event.data.stage) {
+              updatedContext[event.data.stage] = 'error';
+            }
+          });
+        }
+        
+        setStartupContext(updatedContext);
+        
+        // Hide after 1.5 seconds if all done
+        const allDone = Object.values(updatedContext).every(status => status === 'done');
+        if (allDone) {
+          setTimeout(() => {
+            setStartupContext(null);
+          }, 1500);
+        }
+      } catch (error) {
+        console.error('Failed to load startup context:', error);
+        setStartupContext(null);
+      }
     };
 
     loadData();
+
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -46,15 +74,151 @@ export default function Chat() {
     setInputValue('');
     setIsSending(true);
 
-    // Send user message
-    const newMessage = await api.sendMessage(text);
-    setMessages(prev => [...prev, newMessage]);
+    // Close any existing EventSource
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
 
-    // Request mock response
-    const response = await api.generateAssistantResponse();
-    setMessages(prev => [...prev, response]);
-    
-    setIsSending(false);
+    // Append local user message immediately
+    const userMsg: Message = {
+      id: crypto.randomUUID(),
+      role: 'user',
+      content: text,
+      createdAt: new Date().toISOString(),
+    };
+    setMessages(prev => [...prev, userMsg]);
+
+    // Reset startup context to pending
+    setStartupContext({ core: 'pending', breath: 'pending', dream: 'pending', feel: 'pending' });
+
+    try {
+      const chatResponse = await api.createChat(text);
+      
+      const source = api.openChatEvents(
+        chatResponse.event_stream,
+        (event) => {
+          switch (event.event) {
+            case 'context':
+              if (event.data.stage) {
+                setStartupContext(prev => prev ? {
+                  ...prev,
+                  [event.data.stage!]: event.data.status === 'started' ? 'running' : 'pending'
+                } : null);
+              }
+              break;
+            case 'core_done':
+            case 'breath_done':
+            case 'dream_done':
+            case 'feel_done': {
+              const stage = event.event.replace('_done', '') as keyof StartupContext;
+              setStartupContext(prev => prev ? {
+                ...prev,
+                [stage]: 'done'
+              } : null);
+              break;
+            }
+            case 'error':
+              if (event.data.stage) {
+                setStartupContext(prev => prev ? {
+                  ...prev,
+                  [event.data.stage!]: 'error'
+                } : null);
+              }
+              break;
+            case 'token': {
+              const tokenText = event.data.text || '';
+              setMessages(prev => {
+                const last = prev[prev.length - 1];
+                if (last && last.role === 'assistant') {
+                  const updated = [...prev];
+                  updated[updated.length - 1] = {
+                    ...last,
+                    content: last.content + tokenText
+                  };
+                  return updated;
+                } else {
+                  return [...prev, {
+                    id: crypto.randomUUID(),
+                    role: 'assistant',
+                    content: tokenText,
+                    createdAt: new Date().toISOString()
+                  }];
+                }
+              });
+              break;
+            }
+            case 'message_done': {
+              const fullText = event.data.assistant_response || '';
+              setMessages(prev => {
+                const last = prev[prev.length - 1];
+                if (last && last.role === 'assistant') {
+                  const updated = [...prev];
+                  updated[updated.length - 1] = {
+                    ...last,
+                    content: fullText
+                  };
+                  return updated;
+                } else {
+                  return [...prev, {
+                    id: crypto.randomUUID(),
+                    role: 'assistant',
+                    content: fullText,
+                    createdAt: new Date().toISOString()
+                  }];
+                }
+              });
+              break;
+            }
+            case 'done':
+              setStartupContext(null);
+              setMessages(prev => {
+                const last = prev[prev.length - 1];
+                if (last && last.role === 'assistant') {
+                  return prev;
+                }
+                const responseText = event.data.assistant_response || 'Context ready. No assistant response was generated.';
+                return [...prev, {
+                  id: crypto.randomUUID(),
+                  role: 'assistant',
+                  content: responseText,
+                  createdAt: new Date().toISOString()
+                }];
+              });
+              source.close();
+              setIsSending(false);
+              eventSourceRef.current = null;
+              break;
+            default:
+              break;
+          }
+        },
+        (errorEvent) => {
+          console.error('SSE connection error:', errorEvent);
+          setStartupContext(null);
+          setMessages(prev => [...prev, {
+            id: crypto.randomUUID(),
+            role: 'system',
+            content: 'Error: Connection lost or failed to load context.',
+            createdAt: new Date().toISOString(),
+          }]);
+          source.close();
+          setIsSending(false);
+          eventSourceRef.current = null;
+        }
+      );
+      eventSourceRef.current = source;
+    } catch (err: any) {
+      console.error('Failed to create chat:', err);
+      setStartupContext(null);
+      setMessages(prev => [...prev, {
+        id: crypto.randomUUID(),
+        role: 'system',
+        content: `Error starting chat: ${err?.message || err}`,
+        createdAt: new Date().toISOString(),
+      }]);
+      setIsSending(false);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

@@ -109,8 +109,24 @@ class DecayEngine:
         if metadata.get("type") == "permanent":
             return 999.0
 
-        # --- Feel buckets: never decay, fixed moderate score ---
+        # --- Feel buckets ---
+        # Regular feels: fixed moderate score (never decay)
+        # Dream reflections: time-decayed so recent dreams influence more
+        # 普通 feel：固定分数（不衰减）
+        # 梦反思：按时间衰减，最近的梦影响更大
         if metadata.get("type") == "feel":
+            if metadata.get("reflection_type") == "dream":
+                # Dream decay: 10 + 40×e^(-0.05×days)
+                # day 0 → 50, day 7 → ~38, day 14 → ~30, day 30 → ~19, day 60 → ~12
+                # Dreams fade but never fully disappear
+                # 底色永遠是當下的 Elroy，不是所有版本疊在一起
+                created_str = metadata.get("created", metadata.get("last_active", ""))
+                try:
+                    created = datetime.fromisoformat(str(created_str))
+                    days_since = max(0.0, (datetime.now() - created).total_seconds() / 86400)
+                except (ValueError, TypeError):
+                    days_since = 30
+                return round(10.0 + 40.0 * math.exp(-0.05 * days_since), 4)
             return 50.0
 
         importance = max(1, min(10, int(metadata.get("importance", 5))))
