@@ -6,6 +6,7 @@ import {
   AwakeningTriggerResponse,
   ChatCreateResponse,
   ChatEvent,
+  Conversation,
   Dream,
   Message,
   PrivateDiaryEntry,
@@ -108,11 +109,21 @@ class ApiService {
     };
   }
 
-  async createChat(content: string, persona = 'elroy-default'): Promise<ChatCreateResponse> {
+  async createChat(
+    content: string, 
+    persona = 'elroy-default', 
+    conversationId?: string | null,
+    parentId?: string | null
+  ): Promise<ChatCreateResponse> {
     const response = await fetch(apiUrl('/api/chat'), {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message: content, persona}),
+      body: JSON.stringify({
+        message: content, 
+        persona,
+        conversation_id: conversationId || undefined,
+        parent_id: parentId || undefined
+      }),
     });
     return readJson<ChatCreateResponse>(response);
   }
@@ -151,9 +162,33 @@ class ApiService {
     return source;
   }
 
-  // Compatibility shim for the current mock-first Chat component.
-  async getChatEvents(_conversationId: string): Promise<Message[]> {
-    return [];
+  // Fetch message history for a conversation
+  async getChatEvents(conversationId: string): Promise<Message[]> {
+    if (!conversationId || conversationId === 'default') {
+      return [];
+    }
+    const response = await fetch(apiUrl(`/api/conversations/${encodeURIComponent(conversationId)}/messages`));
+    const rawMsgs = await readJson<any[]>(response);
+    return rawMsgs.map((m) => ({
+      id: m.id || crypto.randomUUID(),
+      role: m.role,
+      content: m.content,
+      createdAt: m.created_at || new Date().toISOString(),
+    }));
+  }
+
+  // Fetch all conversation metadata
+  async getConversations(): Promise<Conversation[]> {
+    const response = await fetch(apiUrl('/api/conversations'));
+    return readJson<Conversation[]>(response);
+  }
+
+  // Delete a conversation thread
+  async deleteConversation(conversationId: string): Promise<{ ok: boolean }> {
+    const response = await fetch(apiUrl(`/api/conversations/${encodeURIComponent(conversationId)}`), {
+      method: 'DELETE',
+    });
+    return readJson<{ ok: boolean }>(response);
   }
 
   // Compatibility shim until /api/chat produces real assistant text.

@@ -142,3 +142,12 @@ export interface PrivateDiaryEntry {
   locked_until?: string | null;
   content: string | null;
 }
+
+export interface Conversation {
+  id: string;
+  title: string;
+  persona: string;
+  summary?: string;
+  created_at: string;
+  updated_at: string;
+}

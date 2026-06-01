@@ -1,10 +1,40 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { ChevronDown, ChevronUp, Play } from 'lucide-react';
 import { api } from '../lib/api';
 
 export default function Settings() {
   const [autoReconnect, setAutoReconnect] = useState(true);
   const [isSystemDiagnosticsOpen, setIsSystemDiagnosticsOpen] = useState(false);
+  const [chatHistoryLimit, setChatHistoryLimit] = useState(14);
+  const [isConfigLoading, setIsConfigLoading] = useState(true);
+
+  useEffect(() => {
+    async function loadConfig() {
+      try {
+        const config = await api.getConfig();
+        if (config.chat_history_limit) {
+          setChatHistoryLimit(config.chat_history_limit);
+        }
+      } catch (err) {
+        console.error("Failed to load config:", err);
+      } finally {
+        setIsConfigLoading(false);
+      }
+    }
+    loadConfig();
+  }, []);
+
+  const handleLimitChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setChatHistoryLimit(parseInt(e.target.value));
+  };
+
+  const handleLimitCommit = async () => {
+    try {
+      await api.updateConfig({ chat_history_limit: chatHistoryLimit, persist: true });
+    } catch (err) {
+      console.error("Failed to update config:", err);
+    }
+  };
 
   const systemLogs = [
     { time: '10:42:01', level: 'INIT', color: 'text-primary-fixed-dim', message: 'Core processes\nstabilized.' },
@@ -49,6 +79,29 @@ export default function Settings() {
               >
                 <div className={`w-4 h-4 bg-white rounded-full transition-transform ${autoReconnect ? 'translate-x-5' : 'translate-x-0'}`}></div>
               </button>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <div className="flex justify-between items-center">
+                <span className="font-sans text-[14px] text-charcoal flex items-center gap-1">
+                  Chat History Window Size
+                </span>
+                <span className="font-mono text-[12px] bg-surface-container text-primary px-2 py-0.5 rounded-[4px]">
+                  {chatHistoryLimit} msg
+                </span>
+              </div>
+              <input 
+                type="range" 
+                min="4" 
+                max="40" 
+                step="1"
+                value={chatHistoryLimit}
+                onChange={handleLimitChange}
+                onMouseUp={handleLimitCommit}
+                onTouchEnd={handleLimitCommit}
+                disabled={isConfigLoading}
+                className="w-full accent-primary mt-2" 
+              />
             </div>
           </div>
         </section>

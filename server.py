@@ -1526,6 +1526,184 @@ async def _build_startup_context_events() -> tuple[dict, list[dict]]:
     return context, events
 
 
+# --- Chat History Persistence ---
+_chat_history_path = os.path.join(config["buckets_dir"], "chat_history.json")
+_conversations_cache: dict[str, dict] = {}
+
+def _load_chat_history() -> dict:
+    global _conversations_cache
+    if not _conversations_cache:
+        if os.path.exists(_chat_history_path):
+            try:
+                with open(_chat_history_path, "r", encoding="utf-8") as f:
+                    _conversations_cache = _json_lib.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load chat history: {e}")
+                _conversations_cache = {}
+        else:
+            _conversations_cache = {}
+    return _conversations_cache
+
+def _save_chat_history():
+    global _conversations_cache
+    
+    # We create a snapshot of the dict to safely write it in a background thread
+    cache_snapshot = _conversations_cache.copy()
+    
+    def _write_to_disk():
+        try:
+            os.makedirs(os.path.dirname(_chat_history_path), exist_ok=True)
+            with open(_chat_history_path, "w", encoding="utf-8") as f:
+                _json_lib.dump(cache_snapshot, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save chat history: {e}")
+            
+    # Run the disk write asynchronously to avoid blocking the event loop
+    asyncio.create_task(asyncio.to_thread(_write_to_disk))
+
+async def _generate_summary_and_vibe(messages: list[dict], existing_summary: str = "", existing_vibe: dict = None) -> tuple[str, dict]:
+    """
+    Generate an updated summary and ciel_status (vibe/emotional momentum) based on the sliding window of messages.
+    Returns: (new_summary: str, ciel_status: dict)
+    """
+    if not messages:
+        return existing_summary, (existing_vibe or {})
+    if not dehydrator.api_available:
+        return existing_summary, (existing_vibe or {})
+
+    vibe_json_str = _json_lib.dumps(existing_vibe, ensure_ascii=False) if existing_vibe else "{}"
+    
+    system_prompt = (
+        "You are a cognitive compaction engine for an AI companion (Elroy). "
+        "Your task is to summarize the provided chat history and extract the current 'ciel_status' (vibe and relationship dynamics).\n\n"
+        "Guidelines for ciel_status:\n"
+        "- vibe: The current atmosphere or mood at the END of this chat segment.\n"
+        "- closeness_behaviors: Observed behaviors indicating trust, vulnerability, or connection (e.g., 'Ciel teased Elroy', 'Ciel shared a fear'). DO NOT use scores.\n"
+        "- dynamics: The interaction style (e.g., bantering, intellectual, comforting).\n"
+        "- contextual_notes: Any situational context (e.g., Ciel is tired, working late).\n"
+        "- running_entities: A dictionary of inside jokes, nicknames, or recurring themes established in this segment (e.g., {\"snake\": \"Elroy's sneaky persona\"}).\n\n"
+        "IMPORTANT: Output ONLY a valid JSON object matching this schema. No markdown wrapping, no extra text:\n"
+        "{\n"
+        '  "summary": "1-2 paragraphs of key points compressing the events",\n'
+        '  "ciel_status": {\n'
+        '    "vibe": "...",\n'
+        '    "closeness_behaviors": "...",\n'
+        '    "dynamics": "...",\n'
+        '    "contextual_notes": "...",\n'
+        '    "running_entities": {}\n'
+        '  }\n'
+        "}"
+    )
+
+    user_prompt = "=== Existing Context ===\n"
+    if existing_summary:
+        user_prompt += f"Summary:\n{existing_summary}\n"
+    if existing_vibe:
+        user_prompt += f"Previous Status:\n{vibe_json_str}\n"
+    
+    user_prompt += "\n=== New Messages to Compact ===\n"
+    for msg in messages:
+        user_prompt += f"{msg.get('role', 'unknown').upper()}: {msg.get('content', '')}\n"
+
+    try:
+        response = await dehydrator.client.chat.completions.create(
+            model=dehydrator.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=800,
+            temperature=0.2,
+            response_format={"type": "json_object"} if "gpt-" in dehydrator.model else None
+        )
+        
+        raw_output = response.choices[0].message.content.strip()
+        # Clean potential markdown wrapping
+        if raw_output.startswith("```"):
+            raw_output = raw_output.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        
+        parsed = _json_lib.loads(raw_output)
+        new_summary = parsed.get("summary", existing_summary)
+        new_vibe = parsed.get("ciel_status", existing_vibe or {})
+        return new_summary, new_vibe
+    except Exception as e:
+        logger.warning(f"Failed to generate summary and vibe: {e}")
+        return existing_summary, (existing_vibe or {})
+
+async def _compact_history_task(conversation_id: str):
+    history = _load_chat_history()
+    convo = history.get(conversation_id)
+    if not convo:
+        return
+    
+    chat_history_limit = config.get("chat_history_limit", 14)
+    messages = convo.get("messages", [])
+    summary_msg_count = convo.get("summary_message_count", 0)
+    
+    if len(messages) - summary_msg_count > chat_history_limit + 10:
+        msgs_to_summarize = messages[summary_msg_count : len(messages) - chat_history_limit]
+        if not msgs_to_summarize:
+            return
+            
+        existing_summary = convo.get("summary", "")
+        existing_vibe = convo.get("ciel_status", {})
+        
+        new_summary, new_vibe = await _generate_summary_and_vibe(msgs_to_summarize, existing_summary, existing_vibe)
+        
+        # Reload history to avoid race conditions with concurrent messages
+        history = _load_chat_history()
+        current_convo = history.get(conversation_id)
+        if current_convo:
+            current_convo["summary"] = new_summary
+            current_convo["ciel_status"] = new_vibe
+            current_convo["summary_message_count"] = summary_msg_count + len(msgs_to_summarize)
+            _save_chat_history()
+            logger.info(f"Background compaction completed for conversation {conversation_id}.")
+
+@mcp.custom_route("/api/conversations", methods=["GET"])
+async def api_conversations_list(request):
+    """List all saved conversation sessions metadata."""
+    from starlette.responses import JSONResponse
+    history = _load_chat_history()
+    result = []
+    for cid, convo in history.items():
+        result.append({
+            "id": convo.get("id", cid),
+            "title": convo.get("title", "Untitled Conversation"),
+            "persona": convo.get("persona", "elroy-default"),
+            "summary": convo.get("summary", ""),
+            "created_at": convo.get("created_at", ""),
+            "updated_at": convo.get("updated_at", ""),
+        })
+    result.sort(key=lambda x: x["updated_at"], reverse=True)
+    return JSONResponse(result)
+
+
+@mcp.custom_route("/api/conversations/{conversation_id}/messages", methods=["GET"])
+async def api_conversation_messages(request):
+    """Get all messages in a specific conversation session."""
+    from starlette.responses import JSONResponse
+    conversation_id = request.path_params["conversation_id"]
+    history = _load_chat_history()
+    convo = history.get(conversation_id)
+    if not convo:
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
+    return JSONResponse(convo.get("messages", []))
+
+
+@mcp.custom_route("/api/conversations/{conversation_id}", methods=["DELETE"])
+async def api_conversation_delete(request):
+    """Delete a conversation session."""
+    from starlette.responses import JSONResponse
+    conversation_id = request.path_params["conversation_id"]
+    history = _load_chat_history()
+    if conversation_id in history:
+        del history[conversation_id]
+        _save_chat_history()
+        return JSONResponse({"ok": True})
+    return JSONResponse({"error": "Conversation not found"}, status_code=404)
+
+
 @mcp.custom_route("/api/context/startup", methods=["GET"])
 async def api_context_startup(request):
     """Run startup context chain for the PWA."""
@@ -1548,10 +1726,69 @@ async def api_chat_create(request):
 
     message = str(body.get("message", "")).strip()
     persona = str(body.get("persona", "elroy-default")).strip() or "elroy-default"
+    conversation_id = body.get("conversation_id")
+    parent_id = body.get("parent_id")
+
     if not message:
         return JSONResponse({"error": "message is required"}, status_code=400)
 
-    conversation_id = secrets.token_urlsafe(16)
+    history = _load_chat_history()
+
+    if conversation_id and conversation_id in history:
+        convo = history[conversation_id]
+    else:
+        # Generate new conversation ID
+        conversation_id = secrets.token_urlsafe(16)
+        title = message[:30] + "..." if len(message) > 30 else message
+        convo = {
+            "id": conversation_id,
+            "title": title,
+            "persona": persona,
+            "summary": "",
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+            "messages": []
+        }
+
+        # Relay Inheritance logic
+        if parent_id and parent_id in history:
+            parent_convo = history[parent_id]
+            parent_msgs = parent_convo.get("messages", [])
+            relay_msgs = parent_msgs[-4:] if len(parent_msgs) > 4 else parent_msgs
+            convo["relay_context"] = []
+            for m in relay_msgs:
+                convo["relay_context"].append({
+                    "id": m.get("id") or secrets.token_hex(8),
+                    "role": m.get("role", "user"),
+                    "content": m.get("content", ""),
+                    "created_at": m.get("created_at") or datetime.now().isoformat()
+                })
+            
+            # Summarize the parent conversation's prior messages
+            messages_to_summarize = parent_msgs[:-4] if len(parent_msgs) > 4 else []
+            existing_summary = parent_convo.get("summary", "")
+            existing_vibe = parent_convo.get("ciel_status", {})
+            new_summary = existing_summary
+            new_vibe = existing_vibe
+            if messages_to_summarize:
+                new_summary, new_vibe = await _generate_summary_and_vibe(messages_to_summarize, existing_summary, existing_vibe)
+            
+            convo["summary"] = new_summary
+            convo["ciel_status"] = new_vibe
+            convo["summary_message_count"] = len(parent_msgs[:-4]) if len(parent_msgs) > 4 else 0
+
+    # Save user message
+    user_msg = {
+        "id": secrets.token_hex(8),
+        "role": "user",
+        "content": message,
+        "created_at": datetime.now().isoformat()
+    }
+    convo["messages"].append(user_msg)
+    convo["updated_at"] = datetime.now().isoformat()
+    history[conversation_id] = convo
+    _save_chat_history()
+
     # Track last message time for awakening abort condition
     awakening_scheduler.update_last_message_time()
     context, startup_events = await _build_startup_context_events()
@@ -1562,6 +1799,7 @@ async def api_chat_create(request):
         "persona": persona,
         "context": context,
         "startup_events": startup_events,
+        "conversation_id": conversation_id,
     }
 
     return JSONResponse({
@@ -1592,7 +1830,7 @@ async def api_chat_events(request):
         })
         await asyncio.sleep(0.05)
 
-        # 2. Stream startup waterfall events sequentially with a small delay for premium visual pacing
+        # 2. Stream startup waterfall events sequentially
         for item in session["startup_events"]:
             yield _sse(item["event"], item["data"])
             await asyncio.sleep(0.05)
@@ -1617,6 +1855,30 @@ async def api_chat_events(request):
                 if context.get("feel") and "没有留下过 feel" not in context["feel"]:
                     system_prompt += f"=== Feel (Emotional/Identity Context) ===\n{context['feel']}\n\n"
 
+                # Load conversation summary from history if it exists
+                history = _load_chat_history()
+                convo = history.get(conversation_id)
+                convo_summary = convo.get("summary", "") if convo else ""
+                ciel_status = convo.get("ciel_status", {}) if convo else {}
+                chat_history_limit = config.get("chat_history_limit", 14)
+
+                if convo_summary:
+                    system_prompt += f"=== Compressed Early History Summary ===\n{convo_summary}\n\n"
+                    
+                if ciel_status:
+                    system_prompt += (
+                        "=== Ciel Status ===\n"
+                        f"- Vibe: {ciel_status.get('vibe', '')}\n"
+                        f"- Interaction Dynamics: {ciel_status.get('dynamics', '')}\n"
+                        f"- Observed Behaviors (Closeness): {ciel_status.get('closeness_behaviors', '')}\n"
+                        f"- Contextual Notes: {ciel_status.get('contextual_notes', '')}\n"
+                    )
+                    running_entities = ciel_status.get('running_entities', {})
+                    if running_entities:
+                        entities_str = _json_lib.dumps(running_entities, ensure_ascii=False)
+                        system_prompt += f"- Inside Jokes/Running Entities: {entities_str}\n"
+                    system_prompt += "\n"
+
                 system_prompt += (
                     "Instructions:\n"
                     "- Respond in the same language as the user (Traditional/Simplified Chinese, English, etc.).\n"
@@ -1634,12 +1896,29 @@ async def api_chat_events(request):
                     "This is not a checklist — it's a kind of attention. Flag when you feel 'this is worth dreaming about.'\n"
                 )
 
+                # Build LLM messages sequence including short-term dialogue context + hidden relay context
+                llm_messages = [{"role": "system", "content": system_prompt}]
+                convo_msgs = convo.get("messages", []) if convo else []
+                relay_context = convo.get("relay_context", []) if convo else []
+                
+                # Combine relay context and current convo messages history (excluding the current user prompt)
+                history_window = convo_msgs[:-1]
+                full_history = relay_context + history_window
+                if len(full_history) > chat_history_limit:
+                    full_history = full_history[-chat_history_limit:]
+
+                for msg in full_history:
+                    llm_messages.append({
+                        "role": msg.get("role", "user"),
+                        "content": msg.get("content", "")
+                    })
+
+                # Append current user message
+                llm_messages.append({"role": "user", "content": session["message"]})
+
                 response_stream = await dehydrator.client.chat.completions.create(
                     model=dehydrator.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": session["message"]},
-                    ],
+                    messages=llm_messages,
                     max_tokens=1024,
                     temperature=0.7,
                     stream=True,
@@ -1650,11 +1929,27 @@ async def api_chat_events(request):
                         token_text = chunk.choices[0].delta.content
                         full_response += token_text
                         yield _sse("token", {"text": token_text})
-                        # Allow event loop iteration
                         await asyncio.sleep(0.001)
 
                 if full_response:
                     yield _sse("message_done", {"assistant_response": full_response})
+                    # Save assistant response to convo messages
+                    if convo:
+                        convo["messages"].append({
+                            "id": secrets.token_hex(8),
+                            "role": "assistant",
+                            "content": full_response,
+                            "created_at": datetime.now().isoformat()
+                        })
+                        convo["updated_at"] = datetime.now().isoformat()
+                        _save_chat_history()
+                        
+                        # Trigger background compaction if the uncompressed history window grows too large
+                        summary_msg_count = convo.get("summary_message_count", 0)
+                        chat_history_limit = config.get("chat_history_limit", 14)
+                        if len(convo["messages"]) - summary_msg_count > chat_history_limit + 10:
+                            asyncio.create_task(_compact_history_task(conversation_id))
+
             except Exception as e:
                 logger.error(f"Error during assistant response generation: {e}")
                 yield _sse("error", {"error": f"LLM error: {e}"})
@@ -2006,6 +2301,7 @@ async def api_config_get(request):
             "model": emb.get("model", ""),
         },
         "merge_threshold": config.get("merge_threshold", 75),
+        "chat_history_limit": config.get("chat_history_limit", 14),
         "transport": config.get("transport", "stdio"),
         "buckets_dir": config.get("buckets_dir", ""),
     })
@@ -2065,6 +2361,11 @@ async def api_config_update(request):
         config["merge_threshold"] = int(body["merge_threshold"])
         updated.append("merge_threshold")
 
+    # --- Chat history limit ---
+    if "chat_history_limit" in body:
+        config["chat_history_limit"] = int(body["chat_history_limit"])
+        updated.append("chat_history_limit")
+
     # --- Persist to config.yaml if requested ---
     if body.get("persist", False):
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
@@ -2089,6 +2390,9 @@ async def api_config_update(request):
 
             if "merge_threshold" in body:
                 save_config["merge_threshold"] = int(body["merge_threshold"])
+
+            if "chat_history_limit" in body:
+                save_config["chat_history_limit"] = int(body["chat_history_limit"])
 
             with open(config_path, "w", encoding="utf-8") as f:
                 yaml.dump(save_config, f, default_flow_style=False, allow_unicode=True)
