@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
 import { AwakeningLogEntry, AwakeningSchedulerConfig, AwakeningStatus, PrivateDiaryEntry } from '../types';
-import { AlertCircle, BookOpen, Check, Hourglass, Lock, Moon, Play, Plus, Radio, RefreshCw, Save, Settings2, Trash2, X } from 'lucide-react';
+import { AlertCircle, ArrowLeft, BookOpen, Calendar, Check, Hourglass, Lock, Moon, Play, Plus, Radio, RefreshCw, Save, Settings2, Trash2, X } from 'lucide-react';
 import { cn } from '../lib/utils';
 
 function urlBase64ToUint8Array(base64String: string) {
@@ -89,6 +89,27 @@ function actionLabel(entry: AwakeningLogEntry) {
   return entry.action || 'idle';
 }
 
+function formatTimeRemaining(lockedUntilStr?: string | null) {
+  if (!lockedUntilStr) return 'Locked';
+  const target = new Date(lockedUntilStr);
+  const now = new Date();
+  const diffMs = target.getTime() - now.getTime();
+  if (diffMs <= 0) return 'Unlocking...';
+
+  const diffMins = Math.ceil(diffMs / 60000);
+  if (diffMins < 60) return `${diffMins}m remaining`;
+
+  const diffHours = Math.floor(diffMins / 60);
+  const remainingMins = diffMins % 60;
+  if (diffHours < 24) {
+    return `${diffHours}h ${remainingMins}m remaining`;
+  }
+
+  const diffDays = Math.floor(diffHours / 24);
+  const remainingHours = diffHours % 24;
+  return `${diffDays}d ${remainingHours}h remaining`;
+}
+
 function configFromStatus(status: AwakeningStatus): AwakeningSchedulerConfig {
   return {
     enabled: status.enabled,
@@ -115,6 +136,7 @@ export default function Awake() {
   const [isDiaryOpen, setIsDiaryOpen] = useState(false);
   const [isLoadingDiary, setIsLoadingDiary] = useState(false);
   const [diaryError, setDiaryError] = useState<string | null>(null);
+  const [diaryViewMode, setDiaryViewMode] = useState<'list' | 'detail'>('list');
 
   const loadAwakening = useCallback(async () => {
     try {
@@ -289,12 +311,21 @@ export default function Awake() {
   const openDiary = async (entryId?: string | null) => {
     setIsDiaryOpen(true);
     setSelectedDiaryId(entryId || null);
+    setDiaryViewMode(entryId ? 'detail' : 'list');
     setIsLoadingDiary(true);
     setDiaryError(null);
     try {
       const entries = await api.getPrivateDiary(20, true);
       setDiaryEntries(entries);
-      if (!entryId && entries.length > 0) {
+      if (entryId) {
+        const found = entries.some(e => e.id === entryId);
+        if (found) {
+          setSelectedDiaryId(entryId);
+        } else if (entries.length > 0) {
+          setSelectedDiaryId(entries[0].id);
+          setDiaryViewMode('list');
+        }
+      } else if (entries.length > 0) {
         setSelectedDiaryId(entries[0].id);
       }
     } catch (err: any) {
@@ -305,7 +336,9 @@ export default function Awake() {
     }
   };
 
-  const selectedDiary = diaryEntries.find((entry) => entry.id === selectedDiaryId) || diaryEntries[0] || null;
+  const selectedDiary = useMemo(() => {
+    return diaryEntries.find((entry) => entry.id === selectedDiaryId) || null;
+  }, [diaryEntries, selectedDiaryId]);
 
   return (
     <div className="flex flex-col h-full bg-background relative pt-14 px-4 overflow-y-auto">
@@ -579,19 +612,37 @@ export default function Awake() {
         <section className="flex flex-col gap-4">
           <div className="flex items-center justify-between">
             <h2 className="font-sans text-[18px] font-semibold text-on-surface">Awakening Log</h2>
-            <button
-              onClick={loadAwakening}
-              className="w-8 h-8 flex items-center justify-center border border-hairline rounded-[4px] hover:bg-surface-container transition-colors"
-              title="Refresh awakening state"
-            >
-              <RefreshCw size={14} className="text-charcoal" />
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => openDiary(null)}
+                className="font-mono text-[10px] text-charcoal border border-hairline px-2.5 py-1.5 rounded-[4px] hover:bg-surface-container transition-colors uppercase flex items-center gap-1"
+                title="View private diary entries"
+              >
+                <BookOpen size={12} className="text-unresolved-violet" /> Diary
+              </button>
+              <button
+                onClick={loadAwakening}
+                className="w-8 h-8 flex items-center justify-center border border-hairline rounded-[4px] hover:bg-surface-container transition-colors"
+                title="Refresh awakening state"
+              >
+                <RefreshCw size={14} className="text-charcoal" />
+              </button>
+            </div>
           </div>
           <div className="flex flex-col border border-hairline rounded-[4px] overflow-hidden bg-surface-container-lowest shadow-sm">
             {awakeningLog.map((entry, index) => (
               <div
                 key={`${entry.timestamp}-${index}`}
-                className={cn("p-3 flex flex-col gap-2", index < awakeningLog.length - 1 && "border-b border-hairline")}
+                className={cn(
+                  "p-3 flex flex-col gap-2 transition-colors duration-150",
+                  index < awakeningLog.length - 1 && "border-b border-hairline",
+                  entry.action === 'diary' && "cursor-pointer hover:bg-unresolved-violet/5"
+                )}
+                onClick={() => {
+                  if (entry.action === 'diary') {
+                    openDiary(entry.private_entry_id);
+                  }
+                }}
               >
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-2 min-w-0">
@@ -603,11 +654,14 @@ export default function Awake() {
                     <span className="font-mono text-[12px] text-charcoal truncate">{formatStamp(entry.timestamp)}</span>
                   </div>
                   <span className={cn(
-                    "font-mono text-[10px] uppercase tracking-wider shrink-0",
+                    "font-mono text-[10px] uppercase tracking-wider shrink-0 flex items-center gap-1.5",
                     entry.action === 'push' && "text-primary",
-                    entry.action === 'diary' && "text-unresolved-violet",
+                    entry.action === 'diary' && "text-unresolved-violet font-semibold",
                     (entry.action === 'idle' || entry.aborted || !entry.action) && "text-muted-gray"
                   )}>
+                    {entry.action === 'diary' && (
+                      entry.private_entry_id ? <BookOpen size={10} className="stroke-[2.5px]" /> : <Lock size={10} />
+                    )}
                     {actionLabel(entry)}
                   </span>
                 </div>
@@ -664,6 +718,171 @@ export default function Awake() {
           </div>
         </section>
       </main>
+
+      {/* Backdrop */}
+      {isDiaryOpen && (
+        <div 
+          className="fixed inset-0 bg-black/40 backdrop-blur-[2px] z-50 transition-opacity duration-300 ease-out cursor-pointer"
+          onClick={() => setIsDiaryOpen(false)}
+        />
+      )}
+
+      {/* Drawer Panel */}
+      <div className={cn(
+        "fixed inset-y-0 right-0 z-50 w-full sm:max-w-md bg-surface-container-lowest border-l border-hairline shadow-2xl flex flex-col h-full transition-all duration-300 ease-out transform",
+        isDiaryOpen ? "translate-x-0 opacity-100" : "translate-x-full opacity-0 pointer-events-none"
+      )}>
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-3 border-b border-hairline shrink-0">
+          <div className="flex items-center gap-2">
+            <BookOpen size={16} className="text-unresolved-violet" />
+            <h3 className="font-sans text-[15px] font-semibold text-primary">Private Diary</h3>
+          </div>
+          <button
+            onClick={() => setIsDiaryOpen(false)}
+            className="w-8 h-8 flex items-center justify-center border border-hairline rounded-[4px] hover:bg-surface-container transition-colors"
+            title="Close Diary"
+          >
+            <X size={14} className="text-charcoal" />
+          </button>
+        </div>
+
+        {/* Content Area */}
+        <div className="flex-1 overflow-y-auto flex flex-col">
+          {isLoadingDiary ? (
+            <div className="flex-1 flex flex-col items-center justify-center p-6 gap-2">
+              <RefreshCw size={24} className="text-unresolved-violet animate-spin" />
+              <span className="font-mono text-[10px] text-muted-gray uppercase tracking-wider">Syncing diary...</span>
+            </div>
+          ) : diaryError ? (
+            <div className="flex-1 flex flex-col items-center justify-center p-6 gap-3 text-center">
+              <AlertCircle size={28} className="text-secondary" />
+              <div>
+                <p className="font-mono text-[10px] text-secondary uppercase tracking-wider font-semibold">Error Loading Diary</p>
+                <p className="font-sans text-[13px] text-charcoal/80 mt-1">{diaryError}</p>
+              </div>
+              <button 
+                onClick={() => openDiary(selectedDiaryId)}
+                className="mt-2 font-mono text-[10px] text-charcoal border border-hairline px-3 py-1.5 rounded-[4px] hover:bg-surface-container transition-colors uppercase"
+              >
+                Retry
+              </button>
+            </div>
+          ) : diaryEntries.length === 0 ? (
+            <div className="flex-1 flex flex-col items-center justify-center p-6 text-center gap-2">
+              <BookOpen size={28} className="text-muted-gray" />
+              <p className="font-sans text-[14px] text-muted-gray">No diary entries found.</p>
+            </div>
+          ) : diaryViewMode === 'list' ? (
+            /* LIST VIEW */
+            <div className="flex flex-col p-4 gap-3">
+              <span className="font-mono text-[10px] text-muted-gray uppercase tracking-wider border-b border-hairline pb-1.5">
+                Recent Entries ({diaryEntries.length})
+              </span>
+              <div className="flex flex-col gap-2.5">
+                {diaryEntries.map((entry) => (
+                  <div
+                    key={entry.id}
+                    onClick={() => {
+                      setSelectedDiaryId(entry.id);
+                      setDiaryViewMode('detail');
+                    }}
+                    className={cn(
+                      "p-3 rounded-[4px] border transition-all duration-200 cursor-pointer text-left flex flex-col gap-2",
+                      entry.id === selectedDiaryId
+                        ? "border-unresolved-violet/45 bg-unresolved-violet/5 shadow-sm"
+                        : "border-hairline hover:bg-surface-container-low"
+                    )}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <span className="font-sans text-[14px] font-semibold text-charcoal truncate">
+                        {entry.name || `Diary Entry`}
+                      </span>
+                      <span className="font-mono text-[10px] text-muted-gray shrink-0 mt-0.5">
+                        {formatStamp(entry.created)}
+                      </span>
+                    </div>
+
+                    {entry.locked ? (
+                      <div className="flex items-center gap-1.5 text-unresolved-violet font-mono text-[10px]">
+                        <Lock size={12} className="shrink-0" />
+                        <span>Locked • {formatTimeRemaining(entry.locked_until)}</span>
+                      </div>
+                    ) : (
+                      <p className="font-sans text-[12px] text-charcoal/70 line-clamp-2 leading-relaxed">
+                        {entry.content || "Empty content"}
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            /* DETAIL VIEW */
+            <div className="flex flex-col h-full">
+              {/* Back Bar */}
+              <div className="px-4 py-2 border-b border-hairline bg-surface-container-low/50 flex items-center shrink-0">
+                <button
+                  onClick={() => setDiaryViewMode('list')}
+                  className="font-mono text-[10px] text-charcoal hover:text-primary transition-colors flex items-center gap-1 uppercase"
+                >
+                  <ArrowLeft size={12} /> Back to list
+                </button>
+              </div>
+
+              {/* Entry View */}
+              {selectedDiary ? (
+                <div className="flex-1 p-5 flex flex-col gap-4 overflow-y-auto">
+                  <div className="flex flex-col gap-1.5 border-b border-hairline pb-3.5">
+                    <div className="flex items-start justify-between gap-4">
+                      <h4 className="font-sans text-[16px] font-bold text-charcoal leading-snug">
+                        {selectedDiary.name || `Diary Entry`}
+                      </h4>
+                      {selectedDiary.locked && (
+                        <span className="bg-unresolved-violet/10 text-unresolved-violet px-1.5 py-0.5 rounded-[3px] font-mono text-[9px] uppercase tracking-wider font-semibold flex items-center gap-1 shrink-0">
+                          <Lock size={10} /> Locked
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-1 text-muted-gray font-mono text-[10px]">
+                      <Calendar size={11} />
+                      <span>{formatStamp(selectedDiary.created)}</span>
+                    </div>
+                  </div>
+
+                  {selectedDiary.locked ? (
+                    <div className="flex-1 flex flex-col items-center justify-center p-6 text-center my-auto">
+                      <div className="w-12 h-12 rounded-full bg-unresolved-violet/10 flex items-center justify-center text-unresolved-violet mb-4 animate-pulse">
+                        <Lock size={20} className="stroke-[2.5px]" />
+                      </div>
+                      <h5 className="font-sans text-[15px] font-semibold text-charcoal mb-1">Time-Locked Memory</h5>
+                      <p className="font-sans text-[12px] text-charcoal/70 max-w-[280px] leading-relaxed mb-4">
+                        Elroy has locked this diary entry to process his internal thoughts. It will automatically unlock for Ciel to read when the timer expires.
+                      </p>
+                      <div className="bg-surface-container border border-hairline rounded-[4px] px-4 py-2.5 font-mono text-[11px] text-unresolved-violet font-semibold">
+                        {formatTimeRemaining(selectedDiary.locked_until)}
+                      </div>
+                      <span className="font-mono text-[9px] text-muted-gray mt-2">
+                        Unlocks at {new Date(selectedDiary.locked_until || '').toLocaleString()}
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="flex-1 font-sans text-[13.5px] leading-[22px] text-charcoal/90 whitespace-pre-wrap font-normal tracking-wide break-words">
+                      {selectedDiary.content || (
+                        <span className="italic text-muted-gray">Empty diary content.</span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="flex-1 flex items-center justify-center p-6">
+                  <p className="font-sans text-[13px] text-muted-gray">No entry selected.</p>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
