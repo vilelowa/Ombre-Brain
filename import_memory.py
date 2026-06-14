@@ -537,6 +537,7 @@ class ImportEngine:
                         valence=item.get("valence", 0.5),
                         arousal=item.get("arousal", 0.3),
                         name=item.get("name"),
+                        source="import",
                     )
                     if self.embedding_engine:
                         try:
@@ -661,6 +662,7 @@ class ImportEngine:
                         domain=list(set(bucket["metadata"].get("domain", []) + domain)),
                         valence=round((old_v + valence) / 2, 2),
                         arousal=round((old_a + arousal) / 2, 2),
+                        source="import",
                     )
                     if self.embedding_engine:
                         try:
@@ -681,6 +683,7 @@ class ImportEngine:
             valence=valence,
             arousal=arousal,
             name=name or None,
+            source="import",
         )
         if self.embedding_engine:
             try:

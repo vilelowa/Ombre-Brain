@@ -72,6 +72,21 @@ embedding:
   # base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
   # api_key: ""                  
 
+# --- Chat API / 聊天 API 配置 ---
+# Dedicated chat API for the PWA interface
+# PWA 聊天界面专用 API 配置
+chat:
+  # OpenAI-compatible API (for Gemini, DeepSeek, etc.)
+  # api_key: ""               # ⚠️ Or use env var
+  # base_url: ""
+  # model: "gemini-2.5-flash"
+  # Anthropic native API (for Claude models with cache_control)
+  # anthropic_api_key: ""     # ⚠️ Required for Claude cache breakpoints
+  max_tokens: 1024
+  temperature: 0.7
+  thinking_budget: 10000       # Extended thinking token budget (0=disabled)
+  cache_user_id: "ombre-brain-stable"  # Sticky routing for cache hits
+
 # --- Scoring weights / 检索权重参数 ---
 # total = topic(×4) + emotion(×2) + time(×1.5) + importance(×1)
 scoring_weights:

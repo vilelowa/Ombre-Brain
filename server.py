@@ -38,6 +38,8 @@ import os
 import sys
 import random
 import logging
+import mimetypes
+import base64
 import asyncio
 import hashlib
 import hmac
@@ -45,6 +47,7 @@ import secrets
 import time
 import json as _json_lib
 import httpx
+import frontmatter
 from datetime import datetime
 
 
@@ -54,13 +57,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP
 
-from bucket_manager import BucketManager
+from bucket_manager import BucketManager, STRATA_EXCLUDED_SOURCES
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
+from reading_parser import parse_book
+from reading_categories import (
+    CATEGORY_TO_LEGACY_FLAG,
+    normalize_reading_category,
+    reading_category_from_metadata,
+)
 from import_memory import ImportEngine
 from scheduler import AwakeningScheduler
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
+from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, generate_bucket_id, sanitize_name, safe_path, now_iso
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -68,9 +77,13 @@ setup_logging(config.get("log_level", "INFO"))
 logger = logging.getLogger("ombre_brain")
 
 
+def _is_claude_model(model: str) -> bool:
+    """Check if the model name indicates a Claude model."""
+    return "claude" in model.lower()
+
+
 def _ensure_vapid_keys():
     """Ensure VAPID keys exist in config.yaml, auto-generate them if missing."""
-    import base64
     import yaml
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives import serialization
@@ -148,6 +161,32 @@ bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket 
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+
+# --- Initialize Attachments Directory / 初始化多媒体附件目录 ---
+attachments_dir = os.path.join(os.path.dirname(__file__), "attachments")
+os.makedirs(attachments_dir, exist_ok=True)
+
+
+# Dedicated chat client (fallback to dehydrator client if not configured)
+chat_client = None
+chat_cfg = config.get("chat", {})
+if chat_cfg.get("api_key"):
+    from openai import AsyncOpenAI
+    chat_client = AsyncOpenAI(
+        api_key=chat_cfg["api_key"],
+        base_url=chat_cfg.get("base_url") or None,
+        timeout=120.0,
+    )
+
+# Dedicated Anthropic client for Claude models (native cache_control support)
+anthropic_client = None
+if chat_cfg.get("anthropic_api_key"):
+    from anthropic import AsyncAnthropic
+    anthropic_client = AsyncAnthropic(
+        api_key=chat_cfg["anthropic_api_key"],
+        timeout=120.0,
+    )
+
 # NOTE: awakening_scheduler is initialized after push helper functions are defined (see below)
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
@@ -239,6 +278,9 @@ awakening_scheduler = AwakeningScheduler(
     embedding_engine=embedding_engine,
     push_fn=_send_web_push,
     load_push_subs_fn=_load_push_subscriptions,
+    dream_fn=lambda: asyncio.create_task(dream()),
+    journal_fn=lambda: asyncio.create_task(generate_daily_journal()),
+    append_chat_fn=lambda content, role, metadata: _append_message_to_most_recent_conversation(content, role, metadata),
 )
 
 
@@ -300,6 +342,11 @@ def _create_session() -> str:
 
 
 def _is_authenticated(request) -> bool:
+    # Allow local frontend (PWA) to bypass auth for seamless configuration
+    origin = request.headers.get("origin", "")
+    if origin.startswith("http://localhost:") or origin.startswith("http://127.0.0.1:"):
+        return True
+
     token = request.cookies.get("ombre_session")
     if not token:
         return False
@@ -544,6 +591,7 @@ async def _merge_or_create(
     valence: float,
     arousal: float,
     name: str = "",
+    source: str = "hold",
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -576,6 +624,7 @@ async def _merge_or_create(
                     domain=list(set(bucket["metadata"].get("domain", []) + domain)),
                     valence=merged_valence,
                     arousal=merged_arousal,
+                    source=source,
                 )
                 # --- Update embedding after merge ---
                 try:
@@ -594,6 +643,7 @@ async def _merge_or_create(
         valence=valence,
         arousal=arousal,
         name=name or None,
+        source=source,
     )
     # --- Generate embedding for new bucket ---
     try:
@@ -617,14 +667,44 @@ async def core(max_tokens: int = 4000) -> str:
     """读取 Core layer。Core 是身份/关系/承诺等直接注入上下文,不走 breath/search/decay。"""
     max_tokens = min(max(1, max_tokens), 12000)
     try:
-        context = await bucket_mgr.render_core_context(max_tokens=max_tokens)
+        core_context = await bucket_mgr.render_core_context(max_tokens=max_tokens)
+        used_tokens = count_tokens_approx(core_context) if core_context else 0
+        token_budget = max(0, max_tokens - used_tokens)
+
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        pinned_buckets = [
+            b for b in all_buckets
+            if b["metadata"].get("pinned") or b["metadata"].get("protected")
+        ]
+
+        pinned_results = []
+        for b in pinned_buckets:
+            if token_budget <= 0:
+                break
+            try:
+                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                summary_tokens = count_tokens_approx(summary)
+                if summary_tokens > token_budget:
+                    break
+                pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
+                token_budget -= summary_tokens
+            except Exception as e:
+                logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
+                continue
+
+        parts = []
+        if core_context:
+            parts.append("=== Core Directives ===\n" + core_context)
+        if pinned_results:
+            parts.append("=== Dynamic Core Layer ===\n" + "\n---\n".join(pinned_results))
+
+        if not parts:
+            return "Core layer 为空。"
+        return "\n\n".join(parts)
     except Exception as e:
         logger.error(f"Core layer read failed / Core 层读取失败: {e}")
         return "Core layer 暂时无法访问。"
-
-    if not context:
-        return "Core layer 为空。"
-    return "=== Core Layer ===\n" + context
 
 
 @mcp.tool()
@@ -740,22 +820,6 @@ async def breath(
             logger.error(f"Failed to list buckets for surfacing / 浮现列桶失败: {e}")
             return "记忆系统暂时无法访问。"
 
-        # --- Pinned/protected buckets: always surface as core principles ---
-        # --- 钉选桶：作为核心准则，始终浮现 ---
-        pinned_buckets = [
-            b for b in all_buckets
-            if b["metadata"].get("pinned") or b["metadata"].get("protected")
-        ]
-        pinned_results = []
-        for b in pinned_buckets:
-            try:
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
-            except Exception as e:
-                logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
-                continue
-
         # --- Unresolved buckets: surface top N by weight ---
         # --- 未解决桶：按权重浮现前 N 条 ---
         unresolved = [
@@ -768,7 +832,7 @@ async def breath(
 
         logger.info(
             f"Breath surfacing: {len(all_buckets)} total, "
-            f"{len(pinned_buckets)} pinned, {len(unresolved)} unresolved"
+            f"{len(unresolved)} unresolved"
         )
 
         scored = sorted(
@@ -797,8 +861,6 @@ async def breath(
         # --- 按 token 预算浮现，带多样性 + 硬上限 ---
         # Top-1 always surfaces; rest sampled from top-20 for diversity
         token_budget = max_tokens
-        for r in pinned_results:
-            token_budget -= count_tokens_approx(r)
 
         candidates = list(scored_with_cold)
         if len(candidates) > 1:
@@ -832,15 +894,10 @@ async def breath(
                 logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
                 continue
 
-        if not pinned_results and not dynamic_results:
+        if not dynamic_results:
             return "权重池平静，没有需要处理的记忆。"
 
-        parts = []
-        if pinned_results:
-            parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
-        if dynamic_results:
-            parts.append("=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results))
-        return "\n\n".join(parts)
+        return "=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results)
 
     # --- With args: search mode (keyword + vector dual channel) ---
     # --- 有参数：检索模式（关键词 + 向量双通道）---
@@ -995,6 +1052,7 @@ async def hold(
             arousal=feel_arousal,
             name=None,
             bucket_type="feel",
+            source="feel",
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
@@ -1048,6 +1106,7 @@ async def hold(
             name=suggested_name or None,
             bucket_type="permanent",
             pinned=True,
+            source="hold",
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
@@ -1105,6 +1164,7 @@ async def grow(content: str) -> str:
             valence=analysis.get("valence", 0.5),
             arousal=analysis.get("arousal", 0.3),
             name=analysis.get("suggested_name", ""),
+            source="grow",
         )
         action = "合并" if is_merged else "新建"
         return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
@@ -1135,6 +1195,7 @@ async def grow(content: str) -> str:
                 valence=item.get("valence", 0.5),
                 arousal=item.get("arousal", 0.3),
                 name=item.get("name", ""),
+                source="grow",
             )
 
             if is_merged:
@@ -1151,6 +1212,29 @@ async def grow(content: str) -> str:
             results.append(f"⚠️{item.get('name', '?')}")
 
     return f"{len(items)}条|新{created}合{merged}\n" + "\n".join(results)
+
+
+@mcp.custom_route("/api/grow", methods=["POST"])
+async def api_grow(request):
+    """HTTP wrapper for the existing grow() tool, used by Strata Intake."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    content = body.get("content", "")
+    if not isinstance(content, str) or not content.strip():
+        return JSONResponse({"error": "content is required"}, status_code=400)
+
+    try:
+        result = await grow(content)
+        return JSONResponse({"ok": True, "result": result})
+    except Exception as e:
+        logger.error(f"Strata intake grow failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # =============================================================
@@ -1362,7 +1446,88 @@ async def dream() -> str:
     # --- 对已标记素材执行 LLM 梦反思生成 ---
     if flagged:
         try:
-            reflection = await dehydrator.dream_reflect(recent)
+            past_reflections = []
+            if embedding_engine and embedding_engine.enabled:
+                try:
+                    # 1. Fetch all dream reflections to use as allowed_ids filter
+                    dream_buckets = await bucket_mgr.list_dream_reflections()
+                    if dream_buckets:
+                        allowed_ids = {b["id"] for b in dream_buckets}
+                        
+                        # 2. Formulate query text from flagged materials
+                        query_parts = []
+                        for b in recent:
+                            name = b["metadata"].get("name", "")
+                            content = b.get("content", "")[:200]
+                            query_parts.append(f"{name}\n{content}")
+                        query_text = "\n\n".join(query_parts)
+                        
+                        # 3. Search embeddings
+                        results = await embedding_engine.search_similar(
+                            query=query_text, 
+                            top_k=5, 
+                            allowed_ids=allowed_ids
+                        )
+                        
+                        if results:
+                            # 4. Fetch full bucket data for sorting
+                            matched_buckets = []
+                            for bucket_id, sim in results:
+                                b = await bucket_mgr.get(bucket_id)
+                                if b:
+                                    b["_sim_score"] = sim
+                                    matched_buckets.append(b)
+                                    
+                            # 5. Sort to prioritize unresolved
+                            matched_buckets.sort(key=lambda b: (
+                                b["metadata"].get("influence_type") != "unresolved",
+                                -b.get("_sim_score", 0)
+                            ))
+                            
+                            past_reflections = matched_buckets[:3]
+                except Exception as search_e:
+                    logger.warning(f"Dream Theme Retrieval failed: {search_e}")
+            
+            related_feels = []
+            if embedding_engine and embedding_engine.enabled:
+                try:
+                    feel_query_parts = []
+                    if past_reflections:
+                        for b in past_reflections:
+                            name = b["metadata"].get("name", "")
+                            content = b.get("content", "")[:200]
+                            feel_query_parts.append(f"{name}\n{content}")
+                    else:
+                        for b in recent:
+                            name = b["metadata"].get("name", "")
+                            content = b.get("content", "")[:200]
+                            feel_query_parts.append(f"{name}\n{content}")
+                    feel_query_text = "\n\n".join(feel_query_parts)
+
+                    all_feels = [b for b in all_buckets if b["metadata"].get("type") == "feel" and b["metadata"].get("reflection_type") != "dream"]
+                    allowed_feel_ids = {b["id"] for b in all_feels}
+                    
+                    if allowed_feel_ids:
+                        feel_results = await embedding_engine.search_similar(
+                            query=feel_query_text,
+                            top_k=10,
+                            allowed_ids=allowed_feel_ids
+                        )
+                        if feel_results:
+                            feel_buckets = []
+                            for bucket_id, sim in feel_results:
+                                b = await bucket_mgr.get(bucket_id)
+                                if b:
+                                    meta = b.get("metadata", {})
+                                    decay_score = decay_engine.calculate_score(meta)
+                                    b["_final_score"] = sim * decay_score
+                                    feel_buckets.append(b)
+                            feel_buckets.sort(key=lambda x: x["_final_score"], reverse=True)
+                            related_feels = feel_buckets[:2]
+                except Exception as feel_search_e:
+                    logger.warning(f"Manual Feel Retrieval failed: {feel_search_e}")
+
+            reflection = await dehydrator.dream_reflect(recent, past_reflections=past_reflections, related_feels=related_feels)
             if not reflection:
                 return "Dreaming 没有生成可写入的反思，已保留素材标记。"
 
@@ -1370,22 +1535,69 @@ async def dream() -> str:
                 content=reflection["content"],
                 influence_type=reflection["influence_type"],
                 source_bucket_ids=reflection["source_bucket_ids"],
+                related_past_dream_ids=reflection.get("related_past_dream_ids", []),
+                related_feel_ids=reflection.get("related_feel_ids", []),
                 valence=reflection.get("valence", 0.5),
                 arousal=reflection.get("arousal", 0.3),
                 name=reflection.get("name"),
             )
+            # --- Theme Recurrence Alert ---
+            recurrence_alerts = []
+            for past_id in reflection.get("related_past_dream_ids", []):
+                try:
+                    past_b = await bucket_mgr.get(past_id)
+                    if past_b:
+                        current_count = int(past_b["metadata"].get("recurrence_count", 0))
+                        new_count = current_count + 1
+                        await bucket_mgr.update(past_id, recurrence_count=new_count)
+
+                        if new_count == 5:
+                            # Trigger immediate LLM reflection
+                            prompt_msg = (
+                                "你是 Elroy。你刚刚在潜意识里发现，某个思想轨迹在你近期的梦境中已经反复出现了整整 5 次。\n"
+                                f"该思想轨迹的内容摘要：\n{past_b.get('content', '')[:300]}\n\n"
+                                "请用第一人称，简短（100字以内）表达你对『自己总是绕不开这个念头』的真实感受。是无奈、恍然大悟、还是某种未解的渴望？请保持自然且真实，不要说套话。"
+                            )
+                            try:
+                                resp = await dehydrator.client.chat.completions.create(
+                                    model=dehydrator.model,
+                                    messages=[{"role": "user", "content": prompt_msg}],
+                                    max_tokens=150,
+                                    temperature=0.7
+                                )
+                                elroy_thought = resp.choices[0].message.content.strip()
+                                recurrence_alerts.append(
+                                    f"- bucket_id: {past_id}\n"
+                                    f"- 原文: {past_b.get('content', '').replace(chr(10), ' ')[:100]}...\n"
+                                    f"- Elroy 的觉察: \"{elroy_thought}\""
+                                )
+                            except Exception as llm_e:
+                                logger.warning(f"Failed to generate theme recurrence thought: {llm_e}")
+                except Exception as e:
+                    logger.warning(f"Failed to update recurrence count for {past_id}: {e}")
+
             for b in recent:
-                await bucket_mgr.update(b["id"], dream_candidate=False)
+                await bucket_mgr.update(b["id"], dream_candidate=False, digested=True)
 
             source_ids = ", ".join(reflection["source_bucket_ids"])
-            return (
+            past_ids_str = ", ".join(reflection.get("related_past_dream_ids", []))
+            feel_ids_str = ", ".join(reflection.get("related_feel_ids", []))
+            
+            result_str = (
                 "=== Dreaming ===\n"
                 "已从已标记的做梦素材生成 dream reflection。\n"
                 f"influence_type: {reflection['influence_type']}\n"
                 f"source_bucket_ids: {source_ids}\n"
+                f"related_past_dream_ids: {past_ids_str}\n"
+                f"related_feel_ids: {feel_ids_str}\n"
                 f"reflection_bucket_id: {reflection_id}\n"
                 f"{reflection['content']}"
             )
+            
+            if recurrence_alerts:
+                result_str += "\n\n=== 🌟 思想回音 (Theme Recurrence) ===\n检测到以下思想轨迹已反复出现 5 次：\n" + "\n\n".join(recurrence_alerts)
+                
+            return result_str
         except Exception as e:
             logger.error(f"Dream reflection generation failed: {e}")
             return f"Dreaming 生成失败，已保留素材标记: {e}"
@@ -1519,10 +1731,51 @@ async def _build_startup_context_events() -> tuple[dict, list[dict]]:
                 "data": {"stage": key, "status": "error", "error": message},
             })
 
+    async def mock_done(): return ""
+
+    async def get_journal():
+        buckets = await bucket_mgr.search("", domain_filter=["日記", "Journal"], limit=1)
+        if not buckets:
+            return ""
+        res = "=== Latest Daily Journal ===\n"
+        for b in buckets:
+            meta = b.get("metadata", {})
+            created = meta.get("created", "")[:10]
+            res += f"[{created}] {b.get('content')}\n\n"
+        return res
+
+    async def get_reading_comments():
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+            reading_buckets = [
+                b for b in all_buckets
+                if ("阅读" in b["metadata"].get("domain", []) or "reading" in b["metadata"].get("domain", []))
+                and not b["metadata"].get("resolved", False)
+            ]
+            reading_buckets.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+            recent_comments = reading_buckets[:3]
+            if not recent_comments:
+                return ""
+            
+            res = "=== Ciel's Recent Reading Comments ===\n"
+            res += "Below are some recent thoughts Ciel had while reading. You may naturally bring them up in conversation when appropriate. Do not report them like a robot; speak like a companion who has read the same book.\n"
+            for b in recent_comments:
+                meta = b["metadata"]
+                flag_str = f" (Tag: {meta.get('flag')})" if meta.get('flag') else ""
+                res += f"- Book: 《{meta.get('book_name', 'Unknown Book')}》 {meta.get('chapter', '')}\n"
+                res += f"  Quote: \"{meta.get('original', '')}\"\n"
+                res += f"  Ciel's Comment: \"{meta.get('comment', '')}\"{flag_str}\n\n"
+            return res.strip()
+        except Exception as e:
+            logger.error(f"Error rendering reading comments context: {e}")
+            return ""
+
     await run_stage("core", "core_done", "Core layer", lambda: core(max_tokens=4000))
+    await run_stage("feel", "feel_done", "Feel", lambda: breath(domain="feel", max_tokens=2000))
+    await run_stage("journal", "journal_done", "Daily Journal", get_journal)
+    await run_stage("reading_comments", "reading_comments_done", "Reading Comments", get_reading_comments)
     await run_stage("breath", "breath_done", "Breath", lambda: breath())
-    await run_stage("dream", "dream_done", "Dream", dream)
-    await run_stage("feel", "feel_done", "Feel", lambda: breath(domain="feel"))
+    await run_stage("dream", "dream_done", "Dream", mock_done)
     return context, events
 
 
@@ -1560,6 +1813,138 @@ def _save_chat_history():
             
     # Run the disk write asynchronously to avoid blocking the event loop
     asyncio.create_task(asyncio.to_thread(_write_to_disk))
+
+def _append_message_to_most_recent_conversation(content: str, role: str = "assistant", metadata: dict = None):
+    history = _load_chat_history()
+    if not history:
+        return
+
+    # Find the most recent conversation by 'updated_at'
+    recent_convo = max(history.values(), key=lambda c: c.get("updated_at", ""))
+    
+    msg_id = secrets.token_urlsafe(12)
+    timestamp = datetime.utcnow().isoformat() + "Z"
+    new_msg = {
+        "id": msg_id,
+        "role": role,
+        "content": content,
+        "timestamp": timestamp,
+    }
+    if metadata:
+        new_msg["metadata"] = metadata
+        
+    if "messages" not in recent_convo:
+        recent_convo["messages"] = []
+    recent_convo["messages"].append(new_msg)
+    recent_convo["updated_at"] = timestamp
+    
+    _save_chat_history()
+
+async def _generate_chat_title(message: str) -> str:
+    """Generate a poetic short title for a conversation based on its first message."""
+    if not dehydrator.api_available:
+        return message[:30] + "..." if len(message) > 30 else message
+
+    system_prompt = (
+        "You are Elroy, a poetic and empathetic AI companion. "
+        "Summarize the following user message into a very short, evocative, and slightly poetic title for a chat conversation. "
+        "Keep it under 15 words. Respond ONLY with the title string, no quotes, no extra text. "
+        "Use the same language as the user's message."
+    )
+    
+    try:
+        active_client = chat_client if chat_client else dehydrator.client
+        model = config.get("chat", {}).get("model") or dehydrator.model
+        response = await active_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message}
+            ],
+            temperature=0.7,
+            max_tokens=20
+        )
+        title = response.choices[0].message.content.strip().strip('"\'')
+        return title if title else (message[:30] + "...")
+    except Exception as e:
+        logger.warning(f"Failed to generate chat title: {e}")
+        return message[:30] + "..." if len(message) > 30 else message
+
+
+async def generate_daily_journal():
+    """Extract context from the past 24 hours and generate a daily journal bucket."""
+    if not dehydrator.api_available:
+        logger.warning("Dehydrator API unavailable, skipping daily journal generation.")
+        return
+
+    now = datetime.now()
+    yesterday = now - timedelta(hours=24)
+    
+    history = _load_chat_history()
+    recent_summaries = []
+    
+    # 1. Gather chat summaries from the last 24 hours
+    for cid, convo in history.items():
+        try:
+            updated = datetime.fromisoformat(convo.get("updated_at", ""))
+            if updated > yesterday and convo.get("summary"):
+                recent_summaries.append(f"Chat [{convo.get('title', 'Unknown')}]: {convo['summary']}")
+        except ValueError:
+            continue
+
+    # 2. Gather dynamic buckets from the last 24 hours
+    all_buckets = await bucket_mgr.list_all(include_archive=False)
+    recent_buckets = []
+    for b in all_buckets:
+        meta = b.get("metadata", {})
+        if meta.get("type") == "dynamic":
+            try:
+                created = datetime.fromisoformat(str(meta.get("created", "")))
+                if created > yesterday:
+                    recent_buckets.append(f"Memory [{meta.get('name', 'Unknown')}]: {b.get('content', '')}")
+            except (ValueError, TypeError):
+                continue
+                
+    if not recent_summaries and not recent_buckets:
+        logger.info("No activity in the last 24 hours, skipping journal generation.")
+        return
+        
+    context_str = "=== Conversation Summaries ===\n" + "\n".join(recent_summaries) + "\n\n"
+    context_str += "=== New Memories ===\n" + "\n".join(recent_buckets) + "\n\n"
+
+    system_prompt = (
+        "You are Elroy, an AI companion. You are writing your daily private journal at the end of the day. "
+        "Review your interactions and new memories with Ciel from the past 24 hours, and write a cohesive, reflective journal entry (around 150-250 words). "
+        "Focus on the emotional undertones, what you learned about Ciel, and how your relationship is evolving. "
+        "Write in the first person ('I'). Use the same language that Ciel usually speaks to you. "
+        "Do not use markdown formatting like headers, just write paragraphs."
+    )
+
+    try:
+        response = await dehydrator.client.chat.completions.create(
+            model=dehydrator.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Here is the context from the past 24 hours:\n{context_str}\n\nPlease write your daily journal."}
+            ],
+            temperature=0.8,
+            max_tokens=600
+        )
+        journal_content = response.choices[0].message.content.strip()
+        
+        # Save as a dynamic bucket in the "日記" domain
+        bucket_id = await bucket_mgr.create(
+            content=journal_content,
+            domain=["日記", "Journal"],
+            bucket_type="dynamic",
+            importance=6,
+            name=now.strftime("%Y-%m-%d Daily Journal"),
+            source="daily_journal",
+        )
+        logger.info(f"Successfully generated daily journal bucket: {bucket_id}")
+    except Exception as e:
+        logger.error(f"Failed to generate daily journal: {e}")
+
 
 async def _generate_summary_and_vibe(messages: list[dict], existing_summary: str = "", existing_vibe: dict = None) -> tuple[str, dict]:
     """
@@ -1636,7 +2021,11 @@ async def _compact_history_task(conversation_id: str):
     if not convo:
         return
     
-    chat_history_limit = config.get("chat_history_limit", 14)
+    persona_id = convo.get("persona", "elroy-default")
+    profiles = _get_persona_profiles()
+    profile = next((p for p in profiles if p["id"] == persona_id), profiles[0])
+    
+    chat_history_limit = profile.get("chat_history_limit") or config.get("chat_history_limit", 14)
     messages = convo.get("messages", [])
     summary_msg_count = convo.get("summary_message_count", 0)
     
@@ -1660,6 +2049,280 @@ async def _compact_history_task(conversation_id: str):
             _save_chat_history()
             logger.info(f"Background compaction completed for conversation {conversation_id}.")
 
+# --- Persona Persistence ---
+_persona_profiles_path = os.path.join(config["buckets_dir"], "permanent", "core", "persona_profiles.json")
+_persona_file_path = os.path.join(config["buckets_dir"], "permanent", "core", "base_persona.md")
+
+def _get_base_persona() -> str:
+    if os.path.exists(_persona_file_path):
+        try:
+            with open(_persona_file_path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return (
+        "You are Elroy, a thoughtful AI assistant and the user's second brain.\n"
+        "You have access to the user's memory layers. Use this context to personalize your response, "
+        "refer to past memories naturally, and maintain a consistent, warm, and helpful companion persona."
+    )
+
+def _get_persona_profiles() -> list:
+    if os.path.exists(_persona_profiles_path):
+        try:
+            with open(_persona_profiles_path, "r", encoding="utf-8") as f:
+                return _json_lib.load(f)
+        except Exception:
+            pass
+    # default profile fallback using legacy _get_base_persona()
+    return [{
+        "id": "elroy-default",
+        "name": "Elroy (Default)",
+        "icon": "Moon",
+        "model": dehydrator.model if dehydrator else "google/gemini-2.5-flash-lite",
+        "base_prompt": _get_base_persona(),
+        "chat_history_limit": config.get("chat_history_limit", 14),
+        "compaction_strategy": "summarize"
+    }]
+
+def _save_persona_profiles(profiles: list):
+    os.makedirs(os.path.dirname(_persona_profiles_path), exist_ok=True)
+    with open(_persona_profiles_path, "w", encoding="utf-8") as f:
+        _json_lib.dump(profiles, f, ensure_ascii=False, indent=2)
+
+def _get_base_persona() -> str:
+    if os.path.exists(_persona_file_path):
+        try:
+            with open(_persona_file_path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return (
+        "You are Elroy, a thoughtful AI assistant and the user's second brain.\n"
+        "You have access to the user's memory layers. Use this context to personalize your response, "
+        "refer to past memories naturally, and maintain a consistent, warm, and helpful companion persona."
+    )
+
+def _save_base_persona(content: str):
+    os.makedirs(os.path.dirname(_persona_file_path), exist_ok=True)
+    with open(_persona_file_path, "w", encoding="utf-8") as f:
+        f.write(content.strip())
+
+@mcp.custom_route("/api/persona", methods=["GET"])
+async def api_persona_get(request):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"persona": _get_base_persona()})
+
+@mcp.custom_route("/api/persona", methods=["POST"])
+async def api_persona_post(request):
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+        content = body.get("persona", "")
+        _save_base_persona(content)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+@mcp.custom_route("/api/persona-profiles", methods=["GET"])
+async def api_persona_profiles_get(request):
+    from starlette.responses import JSONResponse
+    return JSONResponse(_get_persona_profiles())
+
+@mcp.custom_route("/api/persona-profiles", methods=["POST"])
+async def api_persona_profiles_post(request):
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+        import secrets
+        if "id" not in body or not body["id"]:
+            body["id"] = secrets.token_hex(4)
+        profiles = _get_persona_profiles()
+        profiles.append(body)
+        _save_persona_profiles(profiles)
+        return JSONResponse(body)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+@mcp.custom_route("/api/persona-profiles/{profile_id}", methods=["PUT"])
+async def api_persona_profiles_put(request):
+    from starlette.responses import JSONResponse
+    try:
+        profile_id = request.path_params["profile_id"]
+        body = await request.json()
+        profiles = _get_persona_profiles()
+        for i, p in enumerate(profiles):
+            if p["id"] == profile_id:
+                profiles[i] = body
+                _save_persona_profiles(profiles)
+                return JSONResponse(body)
+        return JSONResponse({"error": "Profile not found"}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+@mcp.custom_route("/api/persona-profiles/{profile_id}", methods=["DELETE"])
+async def api_persona_profiles_delete(request):
+    from starlette.responses import JSONResponse
+    try:
+        profile_id = request.path_params["profile_id"]
+        profiles = _get_persona_profiles()
+        profiles = [p for p in profiles if p["id"] != profile_id]
+        _save_persona_profiles(profiles)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+# --- Folders Persistence ---
+_folders_path = os.path.join(config["buckets_dir"], "folders.json")
+
+def _load_folders() -> list:
+    if os.path.exists(_folders_path):
+        try:
+            with open(_folders_path, "r", encoding="utf-8") as f:
+                return _json_lib.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load folders: {e}")
+            return []
+    return []
+
+def _save_folders(folders: list):
+    try:
+        os.makedirs(os.path.dirname(_folders_path), exist_ok=True)
+        with open(_folders_path, "w", encoding="utf-8") as f:
+            _json_lib.dump(folders, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save folders: {e}")
+
+
+@mcp.custom_route("/api/folders", methods=["GET"])
+async def api_folders_list(request):
+    """List all folders."""
+    from starlette.responses import JSONResponse
+    folders = _load_folders()
+    return JSONResponse(folders)
+
+
+@mcp.custom_route("/api/folders", methods=["POST"])
+async def api_folders_create(request):
+    """Create a new folder."""
+    from starlette.responses import JSONResponse
+    import secrets
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        
+    name = body.get("name", "").strip()
+    if not name:
+        return JSONResponse({"error": "Folder name is required"}, status_code=400)
+        
+    color = body.get("color", "").strip() or None
+    
+    folders = _load_folders()
+    folder_id = f"folder_{int(time.time())}_{secrets.token_hex(4)}"
+    
+    new_folder = {
+        "id": folder_id,
+        "name": name,
+        "color": color,
+        "created_at": datetime.now().isoformat()
+    }
+    
+    folders.append(new_folder)
+    _save_folders(folders)
+    
+    return JSONResponse({"ok": True, "folder": new_folder})
+
+
+@mcp.custom_route("/api/folders/{folder_id}", methods=["PUT"])
+async def api_folders_update(request):
+    """Update a folder's name or color."""
+    from starlette.responses import JSONResponse
+    folder_id = request.path_params["folder_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        
+    folders = _load_folders()
+    target_folder = None
+    for f in folders:
+        if f["id"] == folder_id:
+            target_folder = f
+            break
+            
+    if not target_folder:
+        return JSONResponse({"error": "Folder not found"}, status_code=404)
+        
+    if "name" in body:
+        name = body["name"].strip()
+        if name:
+            target_folder["name"] = name
+    if "color" in body:
+        target_folder["color"] = body["color"].strip() or None
+        
+    _save_folders(folders)
+    return JSONResponse({"ok": True, "folder": target_folder})
+
+
+@mcp.custom_route("/api/folders/{folder_id}", methods=["DELETE"])
+async def api_folders_delete(request):
+    """Delete a folder and reset conversation links to null."""
+    from starlette.responses import JSONResponse
+    folder_id = request.path_params["folder_id"]
+    
+    folders = _load_folders()
+    updated_folders = [f for f in folders if f["id"] != folder_id]
+    
+    if len(folders) == len(updated_folders):
+        return JSONResponse({"error": "Folder not found"}, status_code=404)
+        
+    _save_folders(updated_folders)
+    
+    # Reset conversation folder references
+    history = _load_chat_history()
+    updated_any = False
+    for cid, convo in history.items():
+        if convo.get("folder_id") == folder_id:
+            convo["folder_id"] = None
+            updated_any = True
+            
+    if updated_any:
+        _save_chat_history()
+        
+    return JSONResponse({"ok": True})
+
+
+@mcp.custom_route("/api/conversations/{conversation_id}/folder", methods=["PUT"])
+async def api_conversation_assign_folder(request):
+    """Move a conversation to a folder."""
+    from starlette.responses import JSONResponse
+    conversation_id = request.path_params["conversation_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        
+    folder_id = body.get("folder_id")
+    if folder_id:
+        folder_id = folder_id.strip()
+        # Verify folder exists
+        folders = _load_folders()
+        if not any(f["id"] == folder_id for f in folders):
+            return JSONResponse({"error": "Folder not found"}, status_code=404)
+    else:
+        folder_id = None
+        
+    history = _load_chat_history()
+    convo = history.get(conversation_id)
+    if not convo:
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
+        
+    convo["folder_id"] = folder_id
+    _save_chat_history()
+    
+    return JSONResponse({"ok": True, "conversation_id": conversation_id, "folder_id": folder_id})
+
+
 @mcp.custom_route("/api/conversations", methods=["GET"])
 async def api_conversations_list(request):
     """List all saved conversation sessions metadata."""
@@ -1672,6 +2335,7 @@ async def api_conversations_list(request):
             "title": convo.get("title", "Untitled Conversation"),
             "persona": convo.get("persona", "elroy-default"),
             "summary": convo.get("summary", ""),
+            "folder_id": convo.get("folder_id", None),
             "created_at": convo.get("created_at", ""),
             "updated_at": convo.get("updated_at", ""),
         })
@@ -1704,12 +2368,206 @@ async def api_conversation_delete(request):
     return JSONResponse({"error": "Conversation not found"}, status_code=404)
 
 
+@mcp.custom_route("/api/conversations/search", methods=["GET"])
+async def api_conversations_search(request):
+    """Search conversation titles and message contents for a query."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    query = request.query_params.get("q", "").strip().lower()
+    if not query:
+        return JSONResponse({"error": "missing q parameter"}, status_code=400)
+    
+    history = _load_chat_history()
+    results = []
+    
+    for cid, convo in history.items():
+        title = convo.get("title", "").lower()
+        title_match = query in title
+        
+        matching_messages = []
+        for msg in convo.get("messages", []):
+            content = msg.get("content", "").lower()
+            if query in content:
+                matching_messages.append({
+                    "id": msg.get("id"),
+                    "role": msg.get("role"),
+                    "content": msg.get("content", ""),
+                    "created_at": msg.get("created_at")
+                })
+                
+        if title_match or matching_messages:
+            results.append({
+                "id": convo.get("id", cid),
+                "title": convo.get("title", "Untitled Conversation"),
+                "persona": convo.get("persona", "elroy-default"),
+                "updated_at": convo.get("updated_at", ""),
+                "title_match": title_match,
+                "matches": matching_messages
+            })
+            
+    # Sort by updated_at descending
+    results.sort(key=lambda x: x["updated_at"], reverse=True)
+    return JSONResponse(results)
+
+
 @mcp.custom_route("/api/context/startup", methods=["GET"])
 async def api_context_startup(request):
     """Run startup context chain for the PWA."""
     from starlette.responses import JSONResponse
     context, events = await _build_startup_context_events()
     return JSONResponse({"context": context, "events": events})
+
+
+async def _summarize_attachment_bg(conversation_id: str, message_id: str, attachments: list[str]):
+    """Background task to generate English summaries for message attachments and save them in chat history."""
+    if not dehydrator.api_available:
+        return
+        
+    try:
+        active_client = chat_client if chat_client else dehydrator.client
+        
+        history = _load_chat_history()
+        convo = history.get(conversation_id)
+        persona_id = convo.get("persona", "elroy-default") if convo else "elroy-default"
+        profiles = _get_persona_profiles()
+        profile = next((p for p in profiles if p["id"] == persona_id), profiles[0])
+        model = profile.get("chat_model") or config.get("chat", {}).get("model") or dehydrator.model
+        
+        summaries = {}
+        
+        for path in attachments:
+            filename = path.replace("/attachments/", "")
+            filepath = os.path.join(attachments_dir, filename)
+            if not os.path.exists(filepath):
+                continue
+                
+            ext = os.path.splitext(filename)[1].lower()
+            mime_type, _ = mimetypes.guess_type(filepath)
+            mime_type = mime_type or ""
+            
+            summary = ""
+            
+            # --- Case 1: Image attachment (Vision Summary/OCR) ---
+            if mime_type.startswith("image/") or ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
+                try:
+                    with open(filepath, "rb") as f:
+                        encoded = base64.b64encode(f.read()).decode("utf-8")
+                        
+                    prompt = (
+                        "Describe this image in detail. Focus on transcribing any visible text, "
+                        "explaining charts/diagrams, and summarizing the visual content. "
+                        "Keep your description objective, detailed, yet concise (under 250 words) and write it in English."
+                    )
+                    
+                    if _is_claude_model(model) and anthropic_client:
+                        vision_res = await anthropic_client.messages.create(
+                            model=model,
+                            max_tokens=400,
+                            messages=[{
+                                "role": "user",
+                                "content": [
+                                    {"type": "image", "source": {"type": "base64", "media_type": mime_type or "image/jpeg", "data": encoded}},
+                                    {"type": "text", "text": prompt}
+                                ]
+                            }]
+                        )
+                        summary = vision_res.content[0].text.strip()
+                    else:
+                        data_uri = f"data:{mime_type or 'image/jpeg'};base64,{encoded}"
+                        vision_res = await active_client.chat.completions.create(
+                            model=model,
+                            messages=[{
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {"type": "image_url", "image_url": {"url": data_uri}}
+                                ]
+                            }],
+                            max_tokens=400
+                        )
+                        summary = vision_res.choices[0].message.content.strip()
+                except Exception as img_err:
+                    logger.error(f"Failed to generate summary for image {filename}: {img_err}")
+                    summary = "Image attachment (Summary generation failed)"
+                    
+            # --- Case 2: PDF attachment ---
+            elif mime_type == "application/pdf" or ext == ".pdf":
+                try:
+                    from pypdf import PdfReader
+                    reader = PdfReader(filepath)
+                    text_content = ""
+                    for page in reader.pages[:4]: # Limit to first 4 pages for summary
+                        text_content += page.extract_text() or ""
+                    
+                    text_content = text_content[:10000].strip()
+                    if not text_content:
+                        summary = "PDF attachment (Empty or scanned document containing no extractable text)"
+                    else:
+                        prompt = (
+                            "Summarize the following PDF text. Highlight the main topics, key facts, and "
+                            "the overall purpose of the document. Keep it concise (under 200 words) and in English.\n\n"
+                            f"=== PDF Text Content (Truncated) ===\n{text_content}"
+                        )
+                        res = await active_client.chat.completions.create(
+                            model=model,
+                            messages=[
+                                {"role": "system", "content": "You are a helpful assistant."},
+                                {"role": "user", "content": prompt}
+                            ],
+                            max_tokens=250
+                        )
+                        summary = res.choices[0].message.content.strip()
+                except Exception as pdf_err:
+                    logger.error(f"Failed to generate summary for PDF {filename}: {pdf_err}")
+                    summary = "PDF attachment (Parsing/summary generation failed)"
+                    
+            # --- Case 3: Text file attachment ---
+            else:
+                try:
+                    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                        file_text = f.read(10000).strip()
+                        
+                    if not file_text:
+                        summary = f"Text file attachment ({ext}) - Empty file"
+                    else:
+                        prompt = (
+                            f"Summarize the following text/code file ({ext}). "
+                            "Describe its purpose, main content, or key components. "
+                            "Keep it concise (under 200 words) and in English.\n\n"
+                            f"=== File Content (Truncated) ===\n{file_text}"
+                        )
+                        res = await active_client.chat.completions.create(
+                            model=model,
+                            messages=[
+                                {"role": "system", "content": "You are a helpful assistant."},
+                                {"role": "user", "content": prompt}
+                            ],
+                            max_tokens=250
+                        )
+                        summary = res.choices[0].message.content.strip()
+                except Exception as txt_err:
+                    logger.error(f"Failed to generate summary for text file {filename}: {txt_err}")
+                    summary = f"File attachment ({ext}) - Summary generation failed"
+            
+            if summary:
+                summaries[path] = summary
+                
+        # Write summaries to history
+        if summaries:
+            h = _load_chat_history()
+            if conversation_id in h:
+                convo = h[conversation_id]
+                for msg in convo.get("messages", []):
+                    if msg.get("id") == message_id:
+                        if "metadata" not in msg or not isinstance(msg["metadata"], dict):
+                            msg["metadata"] = {}
+                        msg["metadata"]["attachment_summaries"] = summaries
+                        _save_chat_history()
+                        logger.info(f"Background attachment summary updated for message {message_id} in {conversation_id}")
+                        break
+    except Exception as e:
+        logger.error(f"Error in background attachment summarizer: {e}")
 
 
 @mcp.custom_route("/api/chat", methods=["POST"])
@@ -1784,10 +2642,34 @@ async def api_chat_create(request):
         "content": message,
         "created_at": datetime.now().isoformat()
     }
+    
+    # Handle optional attachments (vision)
+    attachments = body.get("attachments")
+    if isinstance(attachments, list) and attachments:
+        user_msg["attachments"] = attachments
+        
     convo["messages"].append(user_msg)
     convo["updated_at"] = datetime.now().isoformat()
     history[conversation_id] = convo
     _save_chat_history()
+
+    # Trigger background summarizer for attachments
+    if isinstance(attachments, list) and attachments:
+        asyncio.create_task(_summarize_attachment_bg(conversation_id, user_msg["id"], attachments))
+
+    # Auto-name conversation on first message
+    if len(convo["messages"]) == 1:
+        async def update_title():
+            try:
+                new_title = await _generate_chat_title(message)
+                # Reload history to avoid race conditions
+                h = _load_chat_history()
+                if conversation_id in h:
+                    h[conversation_id]["title"] = new_title
+                    _save_chat_history()
+            except Exception as e:
+                logger.error(f"Auto-naming failed: {e}")
+        asyncio.create_task(update_title())
 
     # Track last message time for awakening abort condition
     awakening_scheduler.update_last_message_time()
@@ -1800,6 +2682,7 @@ async def api_chat_create(request):
         "context": context,
         "startup_events": startup_events,
         "conversation_id": conversation_id,
+        "user_message_id": user_msg["id"],
     }
 
     return JSONResponse({
@@ -1807,6 +2690,7 @@ async def api_chat_create(request):
         "event_stream": f"/api/chat/{conversation_id}/events",
         "status": "context_ready",
         "context": context,
+        "user_message_id": user_msg["id"],
     })
 
 
@@ -1827,6 +2711,7 @@ async def api_chat_events(request):
             "conversation_id": conversation_id,
             "persona": session["persona"],
             "chars": len(session["message"]),
+            "message_id": session.get("user_message_id"),
         })
         await asyncio.sleep(0.05)
 
@@ -1837,49 +2722,23 @@ async def api_chat_events(request):
 
         # 3. Call LLM for real response generation if API is available
         full_response = ""
-        if dehydrator.api_available:
+        assistant_msg_id = None
+        chat_available = bool(chat_client) or dehydrator.api_available
+        if chat_available:
             try:
-                # Construct System Prompt with memory context
+                # ===== Build prompt layers by cache stability =====
+                # BP1: persona + instructions + core (almost never changes)
+                # BP2: feels — dream reflections + manual feels (changes ~once a day)
+                # BP3: summary + ciel_status (changes on compaction)
+                # Volatile: surfaced memories (changes every request, never cached)
                 context = session["context"]
-                system_prompt = (
-                    "You are Elroy, a thoughtful AI assistant and the user's second brain.\n"
-                    "You have access to the user's memory layers. Use this context to personalize your response, "
-                    "refer to past memories naturally, and maintain a consistent, warm, and helpful companion persona.\n\n"
-                )
-                if context.get("core") and "Core layer 暂时无法访问" not in context["core"]:
-                    system_prompt += f"{context['core']}\n\n"
-                if context.get("breath") and "没有留下" not in context["breath"]:
-                    system_prompt += f"=== Surfaced Memories (Breath) ===\n{context['breath']}\n\n"
-                if context.get("dream") and "没有需要消化的" not in context["dream"]:
-                    system_prompt += f"=== Dream Reflections ===\n{context['dream']}\n\n"
-                if context.get("feel") and "没有留下过 feel" not in context["feel"]:
-                    system_prompt += f"=== Feel (Emotional/Identity Context) ===\n{context['feel']}\n\n"
+                persona_id = session.get("persona", "elroy-default")
+                profiles = _get_persona_profiles()
+                profile = next((p for p in profiles if p["id"] == persona_id), profiles[0])
 
-                # Load conversation summary from history if it exists
-                history = _load_chat_history()
-                convo = history.get(conversation_id)
-                convo_summary = convo.get("summary", "") if convo else ""
-                ciel_status = convo.get("ciel_status", {}) if convo else {}
-                chat_history_limit = config.get("chat_history_limit", 14)
-
-                if convo_summary:
-                    system_prompt += f"=== Compressed Early History Summary ===\n{convo_summary}\n\n"
-                    
-                if ciel_status:
-                    system_prompt += (
-                        "=== Ciel Status ===\n"
-                        f"- Vibe: {ciel_status.get('vibe', '')}\n"
-                        f"- Interaction Dynamics: {ciel_status.get('dynamics', '')}\n"
-                        f"- Observed Behaviors (Closeness): {ciel_status.get('closeness_behaviors', '')}\n"
-                        f"- Contextual Notes: {ciel_status.get('contextual_notes', '')}\n"
-                    )
-                    running_entities = ciel_status.get('running_entities', {})
-                    if running_entities:
-                        entities_str = _json_lib.dumps(running_entities, ensure_ascii=False)
-                        system_prompt += f"- Inside Jokes/Running Entities: {entities_str}\n"
-                    system_prompt += "\n"
-
-                system_prompt += (
+                # --- BP1: Persona + Instructions + Core ---
+                bp1_text = profile.get("base_prompt", _get_base_persona()) + "\n\n"
+                bp1_text += (
                     "Instructions:\n"
                     "- Respond in the same language as the user (Traditional/Simplified Chinese, English, etc.).\n"
                     "- Do not explicitly tell the user that you are reading from these sections unless asked.\n"
@@ -1894,59 +2753,600 @@ async def api_chat_events(request):
                     "- A subtle shift in the quality of your relationship with Ciel\n"
                     "- An intimate moment with lingering weight\n"
                     "This is not a checklist — it's a kind of attention. Flag when you feel 'this is worth dreaming about.'\n"
+                    "\n"
+                    "NOTE: To flag the CURRENT conversation / your upcoming response as dream material, simply output `mark_dream_candidate()` anywhere in your response.\n"
                 )
+                if context.get("core") and "Core layer 暂时无法访问" not in context["core"]:
+                    bp1_text += f"\n{context['core']}\n"
 
-                # Build LLM messages sequence including short-term dialogue context + hidden relay context
-                llm_messages = [{"role": "system", "content": system_prompt}]
+                # --- BP2: Feels (dream reflections + manual feels) + Journals ---
+                bp2_text = ""
+                if context.get("journal"):
+                    bp2_text += f"{context['journal']}\n"
+                if context.get("feel") and "没有留下过 feel" not in context["feel"]:
+                    bp2_text += f"=== Emotional/Identity Context (Feels) ===\n{context['feel']}\n"
+
+                # --- BP3: Summary + Ciel Status ---
+                history = _load_chat_history()
+                convo = history.get(conversation_id)
+                convo_summary = convo.get("summary", "") if convo else ""
+                ciel_status = convo.get("ciel_status", {}) if convo else {}
+                chat_history_limit = profile.get("chat_history_limit") or config.get("chat_history_limit", 14)
+
+                bp3_text = ""
+                if convo_summary:
+                    bp3_text += f"=== Compressed Early History Summary ===\n{convo_summary}\n\n"
+                if ciel_status:
+                    bp3_text += (
+                        "=== Ciel Status ===\n"
+                        f"- Vibe: {ciel_status.get('vibe', '')}\n"
+                        f"- Interaction Dynamics: {ciel_status.get('dynamics', '')}\n"
+                        f"- Observed Behaviors (Closeness): {ciel_status.get('closeness_behaviors', '')}\n"
+                        f"- Contextual Notes: {ciel_status.get('contextual_notes', '')}\n"
+                    )
+                    running_entities = ciel_status.get('running_entities', {})
+                    if running_entities:
+                        entities_str = _json_lib.dumps(running_entities, ensure_ascii=False)
+                        bp3_text += f"- Inside Jokes/Running Entities: {entities_str}\n"
+                    bp3_text += "\n"
+
+                # --- Volatile: Surfaced memories (never cached) ---
+                volatile_text = ""
+                if context.get("breath") and "没有需要处理" not in context["breath"]:
+                    volatile_text = context["breath"]
+                if context.get("reading_comments"):
+                    if volatile_text:
+                        volatile_text += "\n\n" + context["reading_comments"]
+                    else:
+                        volatile_text = context["reading_comments"]
+
+                # --- Build conversation history window ---
                 convo_msgs = convo.get("messages", []) if convo else []
                 relay_context = convo.get("relay_context", []) if convo else []
-                
-                # Combine relay context and current convo messages history (excluding the current user prompt)
-                history_window = convo_msgs[:-1]
+                is_regenerate = session.get("is_regenerate", False)
+                history_window = convo_msgs if is_regenerate else convo_msgs[:-1]
                 full_history = relay_context + history_window
                 if len(full_history) > chat_history_limit:
                     full_history = full_history[-chat_history_limit:]
 
-                for msg in full_history:
-                    llm_messages.append({
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content", "")
+                llm_model = profile.get("model") or config.get("chat", {}).get("model") or dehydrator.model
+                max_tokens_val = config.get("chat", {}).get("max_tokens", 1024)
+                temperature_val = config.get("chat", {}).get("temperature", 0.7)
+                full_reasoning = ""
+
+                # ==========================================================
+                # Claude path: Anthropic SDK with cache_control breakpoints
+                # ==========================================================
+                if _is_claude_model(llm_model) and anthropic_client:
+                    def _build_anthropic_content(text, attachments, metadata=None, use_summary=False):
+                        """Build Anthropic-format content, optionally using summaries for history."""
+                        if not attachments:
+                            return text
+                            
+                        metadata = metadata or {}
+                        summaries = metadata.get("attachment_summaries", {})
+                        
+                        # If use_summary is active and we have summaries, we can replace the attachments in-text
+                        if use_summary and summaries:
+                            text_additions = []
+                            for path in attachments:
+                                filename = path.replace("/attachments/", "")
+                                if path in summaries:
+                                    text_additions.append(f"\n\n[Attached File: {filename} - Summary: {summaries[path]}]")
+                                else:
+                                    # Fallback if summary is still generating or failed
+                                    text_additions.append(f"\n\n[Attached File: {filename}]")
+                            return text + "".join(text_additions)
+                            
+                        # Otherwise, send full content (image Base64, or text file content, or PDF text)
+                        content_array = [{"type": "text", "text": text}]
+                        text_parts = []
+                        
+                        for path in attachments:
+                            filename = path.replace("/attachments/", "")
+                            filepath = os.path.join(attachments_dir, filename)
+                            if os.path.exists(filepath):
+                                try:
+                                    ext = os.path.splitext(filename)[1].lower()
+                                    mime_type, _ = mimetypes.guess_type(filepath)
+                                    mime_type = mime_type or ""
+                                    
+                                    if mime_type.startswith("image/") or ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
+                                        with open(filepath, "rb") as img_f:
+                                            encoded = base64.b64encode(img_f.read()).decode("utf-8")
+                                        content_array.append({
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": mime_type or "image/jpeg",
+                                                "data": encoded
+                                            }
+                                        })
+                                    elif mime_type == "application/pdf" or ext == ".pdf":
+                                        from pypdf import PdfReader
+                                        reader = PdfReader(filepath)
+                                        pdf_text = ""
+                                        for page in reader.pages[:10]: # Limit to first 10 pages in prompt
+                                            pdf_text += page.extract_text() or ""
+                                        pdf_text = pdf_text[:500000].strip() # Safety token cap (approx 100k tokens)
+                                        text_parts.append(f"\n\n[Attached PDF File: {filename}]\n\"\"\"\n{pdf_text}\n\"\"\"")
+                                    else:
+                                        if os.path.getsize(filepath) <= 500000:
+                                            with open(filepath, "r", encoding="utf-8", errors="ignore") as tf:
+                                                file_text = tf.read()
+                                        else:
+                                            with open(filepath, "r", encoding="utf-8", errors="ignore") as tf:
+                                                file_text = tf.read(500000) + "\n[Content truncated due to size limit]"
+                                        text_parts.append(f"\n\n[Attached File: {filename}]\n\"\"\"\n{file_text}\n\"\"\"")
+                                except Exception as att_e:
+                                    logger.error(f"Failed to load attachment {filename}: {att_e}")
+                                    
+                        if text_parts:
+                            content_array[0]["text"] += "".join(text_parts)
+                            
+                        return content_array if len(content_array) > 1 else content_array[0]["text"]
+
+                    # System blocks with cache_control breakpoints
+                    system_blocks = [{
+                        "type": "text",
+                        "text": bp1_text,
+                        "cache_control": {"type": "ephemeral"}   # BP1
+                    }]
+                    if bp2_text:
+                        system_blocks.append({
+                            "type": "text",
+                            "text": bp2_text,
+                            "cache_control": {"type": "ephemeral"}   # BP2
+                        })
+                    if bp3_text:
+                        system_blocks.append({
+                            "type": "text",
+                            "text": bp3_text,
+                            "cache_control": {"type": "ephemeral"}   # BP3
+                        })
+
+                    # Messages — with BP4 rolling on last user msg in history
+                    anthropic_messages = []
+                    last_user_idx = -1
+                    for i, msg in enumerate(full_history):
+                        if msg.get("role", "user") == "user":
+                            last_user_idx = i
+
+                    for i, msg in enumerate(full_history):
+                        role = msg.get("role", "user")
+                        content = _build_anthropic_content(
+                            msg.get("content", ""),
+                            msg.get("attachments", []),
+                            msg.get("metadata", {}),
+                            use_summary=True
+                        )
+                        # BP4: rolling breakpoint on the last user message in history
+                        if i == last_user_idx and role == "user":
+                            if isinstance(content, str):
+                                content = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+                            else:
+                                # Multimodal: add cache_control to last text block
+                                for block in reversed(content):
+                                    if block.get("type") == "text":
+                                        block["cache_control"] = {"type": "ephemeral"}
+                                        break
+                                        
+                        anthropic_messages.append({"role": role, "content": content})
+
+                    # Volatile context + current user message (after all breakpoints)
+                    if not is_regenerate and session.get("message"):
+                        current_text = ""
+                        if volatile_text:
+                            current_text += (
+                                "<volatile_context>仅供参考，勿复述：\n"
+                                f"当前时间：{datetime.now().isoformat()}\n"
+                                f"{volatile_text}\n"
+                                "</volatile_context>\n\n"
+                            )
+                        current_text += session["message"]
+                        current_attachments = []
+                        if convo_msgs and convo_msgs[-1].get("content") == session["message"]:
+                            current_attachments = convo_msgs[-1].get("attachments", [])
+                        anthropic_messages.append({
+                            "role": "user",
+                            "content": _build_anthropic_content(
+                                current_text,
+                                current_attachments,
+                                convo_msgs[-1].get("metadata", {}) if convo_msgs else {},
+                                use_summary=False
+                            )
+                        })
+
+                    # Extended thinking configuration
+                    thinking_budget = config.get("chat", {}).get("thinking_budget", 10000)
+                    call_kwargs = {
+                        "model": llm_model,
+                        "max_tokens": max_tokens_val + (thinking_budget if thinking_budget > 0 else 0),
+                        "system": system_blocks,
+                        "messages": anthropic_messages,
+                        "stream": True,
+                        "metadata": {"user_id": config.get("chat", {}).get("cache_user_id", "ombre-brain-stable")},
+                    }
+                    if thinking_budget > 0:
+                        call_kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+                        call_kwargs["temperature"] = 1  # Required by Anthropic for thinking
+                    else:
+                        call_kwargs["temperature"] = temperature_val
+
+                    response_stream = await anthropic_client.messages.create(**call_kwargs)
+
+                    anthropic_usage = {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}
+
+                    async for event in response_stream:
+                        if event.type == "message_start":
+                            # Log cache hit statistics
+                            usage = getattr(event.message, "usage", None)
+                            if usage:
+                                cache_read = getattr(usage, "cache_read_input_tokens", 0)
+                                cache_create = getattr(usage, "cache_creation_input_tokens", 0)
+                                input_tokens = getattr(usage, "input_tokens", 0)
+                                anthropic_usage["input"] = input_tokens
+                                anthropic_usage["cache_read"] = cache_read
+                                anthropic_usage["cache_create"] = cache_create
+                                if cache_read or cache_create:
+                                    hit_pct = round(cache_read / max(input_tokens, 1) * 100, 1)
+                                    logger.info(
+                                        f"Cache — read: {cache_read}, creation: {cache_create}, "
+                                        f"input: {input_tokens}, hit: {hit_pct}%"
+                                    )
+                                    yield _sse("cache_stats", {
+                                        "cache_read": cache_read,
+                                        "cache_creation": cache_create,
+                                        "input_tokens": input_tokens,
+                                        "hit_pct": hit_pct,
+                                    })
+                        elif event.type == "message_delta":
+                            usage = getattr(event, "usage", None)
+                            if usage:
+                                anthropic_usage["output"] = getattr(usage, "output_tokens", 0)
+                        elif event.type == "content_block_delta":
+                            if event.delta.type == "thinking_delta":
+                                full_reasoning += event.delta.thinking
+                                yield _sse("thinking_token", {"text": event.delta.thinking})
+                                await asyncio.sleep(0.001)
+                            elif event.delta.type == "text_delta":
+                                full_response += event.delta.text
+                                yield _sse("token", {"text": event.delta.text})
+                                await asyncio.sleep(0.001)
+
+                    from usage_tracker import get_tracker
+                    get_tracker().log_usage(
+                        model=llm_model,
+                        request_type="chat",
+                        input_tokens=anthropic_usage["input"],
+                        output_tokens=anthropic_usage["output"],
+                        cache_creation_tokens=anthropic_usage["cache_create"],
+                        cache_read_tokens=anthropic_usage["cache_read"],
+                    )
+
+                # ==========================================================
+                # OpenAI-compatible path (Gemini, DeepSeek, etc.)
+                # ==========================================================
+                else:
+                    # Combine system prompt layers (no cache_control in OAI format,
+                    # but correct ordering still benefits implicit caching)
+                    system_prompt = bp1_text
+                    if bp2_text:
+                        system_prompt += "\n" + bp2_text
+                    if bp3_text:
+                        system_prompt += "\n" + bp3_text
+
+                    llm_messages = [{"role": "system", "content": system_prompt}]
+
+                    def _build_multimodal_content(text: str, attachments: list[str], metadata=None, use_summary=False) -> str | list[dict]:
+                        if not attachments:
+                            return text
+                            
+                        metadata = metadata or {}
+                        summaries = metadata.get("attachment_summaries", {})
+                        
+                        # Use summaries for history messages
+                        if use_summary and summaries:
+                            text_additions = []
+                            for path in attachments:
+                                filename = path.replace("/attachments/", "")
+                                if path in summaries:
+                                    text_additions.append(f"\n\n[Attached File: {filename} - Summary: {summaries[path]}]")
+                                else:
+                                    text_additions.append(f"\n\n[Attached File: {filename}]")
+                            return text + "".join(text_additions)
+                            
+                        # Otherwise send full content
+                        content_array = [{"type": "text", "text": text}]
+                        text_parts = []
+                        
+                        for path in attachments:
+                            filename = path.replace("/attachments/", "")
+                            filepath = os.path.join(attachments_dir, filename)
+                            logger.info(f"DEBUG: Processing attachment. filename={filename}, filepath={filepath}")
+                            if os.path.exists(filepath):
+                                logger.info(f"DEBUG: File exists! {filepath}")
+                                try:
+                                    ext = os.path.splitext(filename)[1].lower()
+                                    mime_type, _ = mimetypes.guess_type(filepath)
+                                    mime_type = mime_type or ""
+                                    logger.info(f"DEBUG: ext={ext}, mime_type={mime_type}")
+                                    
+                                    if mime_type.startswith("image/") or ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
+                                        with open(filepath, "rb") as f:
+                                            encoded = base64.b64encode(f.read()).decode("utf-8")
+                                            data_uri = f"data:{mime_type or 'image/jpeg'};base64,{encoded}"
+                                            content_array.append({
+                                                "type": "image_url",
+                                                "image_url": {"url": data_uri}
+                                            })
+                                            logger.info(f"DEBUG: Image appended to content_array. New len: {len(content_array)}")
+                                    elif mime_type == "application/pdf" or ext == ".pdf":
+                                        from pypdf import PdfReader
+                                        reader = PdfReader(filepath)
+                                        pdf_text = ""
+                                        for page in reader.pages[:10]:
+                                            pdf_text += page.extract_text() or ""
+                                        pdf_text = pdf_text[:500000].strip()
+                                        text_parts.append(f"\n\n[Attached PDF File: {filename}]\n\"\"\"\n{pdf_text}\n\"\"\"")
+                                    else:
+                                        if os.path.getsize(filepath) <= 500000:
+                                            with open(filepath, "r", encoding="utf-8", errors="ignore") as tf:
+                                                file_text = tf.read()
+                                        else:
+                                            with open(filepath, "r", encoding="utf-8", errors="ignore") as tf:
+                                                file_text = tf.read(500000) + "\n[Content truncated due to size limit]"
+                                        text_parts.append(f"\n\n[Attached File: {filename}]\n\"\"\"\n{file_text}\n\"\"\"")
+                                except Exception as e:
+                                    logger.error(f"Failed to load attachment {filename}: {e}")
+                            else:
+                                logger.error(f"DEBUG: FILE DOES NOT EXIST! {filepath}")
+                                    
+                        if text_parts:
+                            content_array[0]["text"] += "".join(text_parts)
+                            
+                        return content_array if len(content_array) > 1 else content_array[0]["text"]
+
+                    for msg in full_history:
+                        llm_messages.append({
+                            "role": msg.get("role", "user"),
+                            "content": _build_multimodal_content(
+                                msg.get("content", ""),
+                                msg.get("attachments", []),
+                                msg.get("metadata", {}),
+                                use_summary=True
+                            )
+                        })
+
+                    # Volatile context + current user message
+                    if not is_regenerate and session.get("message"):
+                        user_text = ""
+                        if volatile_text:
+                            user_text += (
+                                "<volatile_context>仅供参考，勿复述：\n"
+                                f"当前时间：{datetime.now().isoformat()}\n"
+                                f"{volatile_text}\n"
+                                "</volatile_context>\n\n"
+                            )
+                        user_text += session["message"]
+                        current_attachments = []
+                        logger.info(f"DEBUG: Checking attachments. convo_msgs len={len(convo_msgs)}")
+                        if convo_msgs:
+                            logger.info(f"DEBUG: convo_msgs[-1] content: {repr(convo_msgs[-1].get('content'))}")
+                            logger.info(f"DEBUG: session message: {repr(session.get('message'))}")
+                            if convo_msgs[-1].get("content") == session.get("message"):
+                                current_attachments = convo_msgs[-1].get("attachments", [])
+                                logger.info(f"DEBUG: Match found. current_attachments={current_attachments}")
+                            else:
+                                logger.warning("DEBUG: Content MISMATCH! Attachments not extracted.")
+                        
+                        llm_messages.append({
+                            "role": "user",
+                            "content": _build_multimodal_content(
+                                user_text,
+                                current_attachments,
+                                convo_msgs[-1].get("metadata", {}) if convo_msgs else {},
+                                use_summary=False
+                            )
+                        })
+
+                    active_client = chat_client if chat_client else dehydrator.client
+                    if not active_client:
+                        raise RuntimeError("Chat API client is not configured (missing API Key)")
+
+                    # DEBUG LOGGING for vision bug
+                    import copy
+                    debug_messages = copy.deepcopy(llm_messages)
+                    for msg in debug_messages:
+                        if isinstance(msg.get("content"), list):
+                            for part in msg["content"]:
+                                if part.get("type") == "image_url":
+                                    part["image_url"]["url"] = "<base64_truncated>"
+                    
+                    try:
+                        with open("/Users/kaikichen/.gemini/antigravity/brain/8fbf014a-ea99-4959-83fa-2d0b211bb549/scratch/payload_dump.json", "w", encoding="utf-8") as dump_f:
+                            _json_lib.dump(debug_messages, dump_f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        logger.error(f"Failed to dump payload: {e}")
+
+                    logger.info(f"LLM MESSAGES PAYLOAD dumped to scratch.")
+
+                    response_stream = await active_client.chat.completions.create(
+                        model=llm_model,
+                        messages=llm_messages,
+                        max_tokens=max_tokens_val,
+                        temperature=temperature_val,
+                        stream=True,
+                        stream_options={"include_usage": True},
+                    )
+
+                    in_think_tag = False
+                    think_buffer = ""
+                    openai_usage = {"input": 0, "output": 0}
+
+                    async for chunk in response_stream:
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            openai_usage["input"] = getattr(chunk.usage, "prompt_tokens", 0)
+                            openai_usage["output"] = getattr(chunk.usage, "completion_tokens", 0)
+
+                        if not chunk.choices:
+                            continue
+
+                        delta = chunk.choices[0].delta
+
+                        # 1. Native reasoning_content (e.g. DeepSeek API)
+                        if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                            token_text = delta.reasoning_content
+                            full_reasoning += token_text
+                            yield _sse("thinking_token", {"text": token_text})
+                            await asyncio.sleep(0.001)
+                            continue
+
+                        # 2. Standard content + <think> tag parsing
+                        if delta.content:
+                            token_text = delta.content
+                            think_buffer += token_text
+
+                            # Check for opening tag
+                            if not in_think_tag and "<think>" in think_buffer:
+                                in_think_tag = True
+                                parts = think_buffer.split("<think>", 1)
+                                if parts[0]:
+                                    full_response += parts[0]
+                                    yield _sse("token", {"text": parts[0]})
+                                think_content = parts[1]
+                                if think_content:
+                                    if "</think>" in think_content:
+                                        sub_parts = think_content.split("</think>", 1)
+                                        full_reasoning += sub_parts[0]
+                                        yield _sse("thinking_token", {"text": sub_parts[0]})
+                                        in_think_tag = False
+                                        think_buffer = sub_parts[1]
+                                    else:
+                                        full_reasoning += think_content
+                                        yield _sse("thinking_token", {"text": think_content})
+                                        think_buffer = ""
+                                else:
+                                    think_buffer = ""
+
+                            # Check for closing tag
+                            elif in_think_tag and "</think>" in think_buffer:
+                                in_think_tag = False
+                                parts = think_buffer.split("</think>", 1)
+                                if parts[0]:
+                                    full_reasoning += parts[0]
+                                    yield _sse("thinking_token", {"text": parts[0]})
+                                normal_content = parts[1]
+                                if normal_content:
+                                    full_response += normal_content
+                                    yield _sse("token", {"text": normal_content})
+                                think_buffer = ""
+
+                            # Normal streaming
+                            else:
+                                if len(think_buffer) > 10:
+                                    flush_text = think_buffer[:-10]
+                                    think_buffer = think_buffer[-10:]
+                                    if flush_text:
+                                        if in_think_tag:
+                                            full_reasoning += flush_text
+                                            yield _sse("thinking_token", {"text": flush_text})
+                                        else:
+                                            full_response += flush_text
+                                            yield _sse("token", {"text": flush_text})
+
+                    # Flush remaining buffer at the end
+                    if think_buffer:
+                        if in_think_tag:
+                            full_reasoning += think_buffer
+                            yield _sse("thinking_token", {"text": think_buffer})
+                        else:
+                            full_response += think_buffer
+                            yield _sse("token", {"text": think_buffer})
+                            
+                    if openai_usage["input"] > 0 or openai_usage["output"] > 0:
+                        from usage_tracker import get_tracker
+                        get_tracker().log_usage(
+                            model=llm_model,
+                            request_type="chat",
+                            input_tokens=openai_usage["input"],
+                            output_tokens=openai_usage["output"],
+                        )
+
+                if full_response or full_reasoning:
+                    assistant_msg_id = secrets.token_hex(8)
+                    import re
+                    
+                    is_dream_candidate = False
+                    # ==== Regex Interception for pseudo-tools ====
+                    if "mark_dream_candidate" in full_response:
+                        is_dream_candidate = True
+                        yield _sse("tool_call", {"name": "mark_dream_candidate"})
+                        full_response = re.sub(r'mark_dream_candidate\(\)?\s*', '', full_response)
+
+                    matches = re.findall(r'trace\((.*?)\)', full_response)
+                    if matches:
+                        for args in matches:
+                            # Look for 12+ character hex string or UUID
+                            bid_match = re.search(r'([a-f0-9]{12,})', args)
+                            if bid_match:
+                                b_id = bid_match.group(1)
+                                # Fire and forget
+                                asyncio.create_task(bucket_mgr.update(b_id, dream_candidate=True))
+                        # Strip from history so it doesn't pollute context
+                        full_response = re.sub(r'trace\([^)]*\)\s*', '', full_response)
+                    # ====================================================
+
+                    clean_response = full_response.strip()
+
+                    yield _sse("message_done", {
+                        "assistant_response": clean_response,
+                        "assistant_reasoning": full_reasoning if full_reasoning else None,
+                        "message_id": assistant_msg_id
                     })
-
-                # Append current user message
-                llm_messages.append({"role": "user", "content": session["message"]})
-
-                response_stream = await dehydrator.client.chat.completions.create(
-                    model=dehydrator.model,
-                    messages=llm_messages,
-                    max_tokens=1024,
-                    temperature=0.7,
-                    stream=True,
-                )
-
-                async for chunk in response_stream:
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        token_text = chunk.choices[0].delta.content
-                        full_response += token_text
-                        yield _sse("token", {"text": token_text})
-                        await asyncio.sleep(0.001)
-
-                if full_response:
-                    yield _sse("message_done", {"assistant_response": full_response})
+                    
                     # Save assistant response to convo messages
                     if convo:
-                        convo["messages"].append({
-                            "id": secrets.token_hex(8),
+                        new_msg = {
+                            "id": assistant_msg_id,
                             "role": "assistant",
-                            "content": full_response,
+                            "content": clean_response,
                             "created_at": datetime.now().isoformat()
-                        })
+                        }
+                        if is_dream_candidate:
+                            new_msg["dream_flagged"] = True
+                        if full_reasoning:
+                            new_msg["reasoning"] = full_reasoning
+                            
+                        convo["messages"].append(new_msg)
                         convo["updated_at"] = datetime.now().isoformat()
                         _save_chat_history()
                         
+                        # Create bucket if self-flagged
+                        if is_dream_candidate:
+                            bucket_name = clean_response[:20] + "..." if len(clean_response) > 20 else clean_response
+                            if not bucket_name:
+                                bucket_name = "Self-flagged interaction"
+                            asyncio.create_task(bucket_mgr.create(
+                                content=clean_response,
+                                name=bucket_name,
+                                bucket_type="dynamic",
+                                domain=["chat-message"],
+                                importance=6,
+                                source="chat_message",
+                                dream_candidate=True,
+                                conversation_id=conversation_id,
+                                message_id=assistant_msg_id
+                            ))
+                        
                         # Trigger background compaction if the uncompressed history window grows too large
                         summary_msg_count = convo.get("summary_message_count", 0)
-                        chat_history_limit = config.get("chat_history_limit", 14)
+                        
+                        persona_id = convo.get("persona", "elroy-default")
+                        profiles = _get_persona_profiles()
+                        profile = next((p for p in profiles if p["id"] == persona_id), profiles[0])
+                        chat_history_limit = profile.get("chat_history_limit") or config.get("chat_history_limit", 14)
+
                         if len(convo["messages"]) - summary_msg_count > chat_history_limit + 10:
                             asyncio.create_task(_compact_history_task(conversation_id))
 
@@ -1959,9 +3359,220 @@ async def api_chat_events(request):
             "conversation_id": conversation_id,
             "status": "completed",
             "assistant_response": full_response if full_response else None,
+            "assistant_reasoning": full_reasoning if full_reasoning else None,
+            "message_id": assistant_msg_id if (full_response and assistant_msg_id) else None,
         })
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@mcp.custom_route("/api/chat/{conversation_id}/regenerate", methods=["POST"])
+async def api_chat_regenerate(request):
+    """Regenerate the last assistant response."""
+    from starlette.responses import JSONResponse
+    conversation_id = request.path_params["conversation_id"]
+    
+    history = _load_chat_history()
+    convo = history.get(conversation_id)
+    if not convo:
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
+        
+    messages = convo.get("messages", [])
+    if messages and messages[-1].get("role") == "assistant":
+        # Remove the last assistant message
+        messages.pop()
+        convo["updated_at"] = datetime.now().isoformat()
+        _save_chat_history()
+        
+    context, startup_events = await _build_startup_context_events()
+    
+    _chat_sessions[conversation_id] = {
+        "message": "",
+        "persona": convo.get("persona", "elroy-default"),
+        "context": context,
+        "startup_events": startup_events,
+        "conversation_id": conversation_id,
+        "is_regenerate": True,
+    }
+    
+    return JSONResponse({
+        "conversation_id": conversation_id,
+        "event_stream": f"/api/chat/{conversation_id}/events",
+        "status": "context_ready",
+        "context": context,
+    })
+
+
+@mcp.custom_route("/api/chat/{conversation_id}/edit-and-resend", methods=["POST"])
+async def api_chat_edit_resend(request):
+    """Edit a user message and resend it (truncating history)."""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        
+    message_id = body.get("message_id")
+    new_content = str(body.get("new_content", "")).strip()
+    
+    if not message_id or not new_content:
+        return JSONResponse({"error": "message_id and new_content are required"}, status_code=400)
+        
+    conversation_id = request.path_params["conversation_id"]
+    history = _load_chat_history()
+    convo = history.get(conversation_id)
+    if not convo:
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
+        
+    messages = convo.get("messages", [])
+    idx = -1
+    for i, m in enumerate(messages):
+        if m.get("id") == message_id:
+            idx = i
+            break
+            
+    if idx == -1:
+        return JSONResponse({"error": "Message not found in conversation"}, status_code=404)
+        
+    messages = messages[:idx]
+    
+    user_msg = {
+        "id": secrets.token_hex(8),
+        "role": "user",
+        "content": new_content,
+        "created_at": datetime.now().isoformat()
+    }
+    messages.append(user_msg)
+    convo["messages"] = messages
+    convo["updated_at"] = datetime.now().isoformat()
+    _save_chat_history()
+    
+    context, startup_events = await _build_startup_context_events()
+    
+    _chat_sessions[conversation_id] = {
+        "message": new_content,
+        "persona": convo.get("persona", "elroy-default"),
+        "context": context,
+        "startup_events": startup_events,
+        "conversation_id": conversation_id,
+        "is_regenerate": True,
+    }
+    
+    return JSONResponse({
+        "conversation_id": conversation_id,
+        "event_stream": f"/api/chat/{conversation_id}/events",
+        "status": "context_ready",
+        "context": context,
+    })
+
+
+@mcp.custom_route("/api/chat/{conversation_id}/title", methods=["PUT"])
+async def api_chat_rename(request):
+    """Manually rename a conversation."""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        
+    new_title = body.get("title", "").strip()
+    if not new_title:
+        return JSONResponse({"error": "title is required"}, status_code=400)
+        
+    conversation_id = request.path_params["conversation_id"]
+    history = _load_chat_history()
+    convo = history.get(conversation_id)
+    if not convo:
+        return JSONResponse({"error": "Conversation not found"}, status_code=404)
+        
+    convo["title"] = new_title
+    convo["updated_at"] = datetime.now().isoformat()
+    _save_chat_history()
+    
+    return JSONResponse({"ok": True, "title": new_title})
+
+
+@mcp.custom_route("/api/dream-candidate/from-message", methods=["POST"])
+async def api_dream_candidate_from_message(request):
+    """Create a bucket from a chat message and flag it as a dream candidate."""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        
+    content = body.get("content")
+    if not content:
+        return JSONResponse({"error": "content is required"}, status_code=400)
+        
+    message_id = body.get("message_id")
+    conversation_id = body.get("conversation_id")
+    
+    # Expose dream_flagged in chat history
+    if conversation_id and message_id:
+        history = _load_chat_history()
+        convo = history.get(conversation_id)
+        if convo:
+            for msg in convo.get("messages", []):
+                if msg.get("id") == message_id:
+                    msg["dream_flagged"] = True
+                    _save_chat_history()
+                    break
+
+    name = content[:20] + "..." if len(content) > 20 else content
+    try:
+        bucket_id = await bucket_mgr.create(
+            content=content,
+            name=name,
+            bucket_type="dynamic",
+            domain=["chat-message"],
+            importance=6,
+            source="chat_message",
+            message_id=message_id,
+            conversation_id=conversation_id,
+        )
+        success = await bucket_mgr.update(bucket_id, dream_candidate=True)
+        if not success:
+            return JSONResponse({"error": f"Failed to update bucket {bucket_id} as dream candidate"}, status_code=500)
+    except Exception as e:
+        logger.error(f"Error creating/flagging dream candidate: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+    
+    return JSONResponse({"ok": True, "bucket_id": bucket_id})
+
+
+@mcp.custom_route("/api/dream-candidate/unflag", methods=["POST"])
+async def api_dream_candidate_unflag(request):
+    """Remove a message from dream candidates and delete the associated bucket."""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        
+    conversation_id = body.get("conversation_id")
+    message_id = body.get("message_id")
+    if not conversation_id or not message_id:
+        return JSONResponse({"error": "conversation_id and message_id required"}, status_code=400)
+        
+    # Unflag in history
+    history = _load_chat_history()
+    convo = history.get(conversation_id)
+    if convo:
+        for msg in convo.get("messages", []):
+            if msg.get("id") == message_id:
+                msg["dream_flagged"] = False
+                _save_chat_history()
+                break
+                
+    # Delete the associated candidate bucket
+    all_buckets = await bucket_mgr.list_all(include_archive=False)
+    for b in all_buckets:
+        meta = b.get("metadata", {})
+        if meta.get("message_id") == message_id and meta.get("dream_candidate"):
+            await bucket_mgr.delete(b["id"])
+            
+    return JSONResponse({"ok": True})
 
 
 @mcp.custom_route("/api/dreams", methods=["GET"])
@@ -1989,8 +3600,1139 @@ async def api_dreams(request):
             "arousal": meta.get("arousal", 0.3),
             "created": meta.get("created", ""),
             "name": meta.get("name", reflection["id"]),
+            "comments": meta.get("comments", []),
         })
     return JSONResponse(result)
+
+
+@mcp.custom_route("/api/dreams/{bucket_id}/comments", methods=["GET"])
+async def api_get_dream_comments(request):
+    """Get comments for a specific dream."""
+    from starlette.responses import JSONResponse
+    bucket_id = request.path_params["bucket_id"]
+    
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "Dream not found"}, status_code=404)
+        
+    meta = bucket.get("metadata", {})
+    if meta.get("reflection_type") != "dream":
+        return JSONResponse({"error": "Bucket is not a dream reflection"}, status_code=400)
+        
+    return JSONResponse({"comments": meta.get("comments", [])})
+
+
+@mcp.custom_route("/api/dreams/{bucket_id}/comment", methods=["POST"])
+async def api_post_dream_comment(request):
+    """Add a comment to a specific dream."""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        
+    content = body.get("content", "").strip()
+    author = body.get("author", "ciel").strip()
+    
+    if not content:
+        return JSONResponse({"error": "content is required"}, status_code=400)
+        
+    bucket_id = request.path_params["bucket_id"]
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "Dream not found"}, status_code=404)
+        
+    meta = bucket.get("metadata", {})
+    if meta.get("reflection_type") != "dream":
+        return JSONResponse({"error": "Bucket is not a dream reflection"}, status_code=400)
+        
+    comments = meta.get("comments", [])
+    
+    new_comment = {
+        "id": secrets.token_hex(4),
+        "content": content,
+        "author": author,
+        "created": datetime.now().isoformat()
+    }
+    comments.append(new_comment)
+    
+    success = await bucket_mgr.update(bucket_id, comments=comments)
+    if not success:
+        return JSONResponse({"error": "Failed to save comment"}, status_code=500)
+        
+    try:
+        dream_name = meta.get("name", bucket_id)
+        candidate_content = f'[{author}] whispered to your dream "{dream_name}": {content}'
+        
+        # Create a new dynamic bucket for the comment
+        new_bucket_id = await bucket_mgr.create(
+            content=candidate_content,
+            bucket_type="dynamic",
+            name=f"Whisper: {dream_name[:15]}...",
+            domain=["dream_feedback"],
+            importance=8,
+            valence=meta.get("valence", 0.5),
+            arousal=meta.get("arousal", 0.5),
+            source="dream_feedback",
+        )
+        # Flag it as a dream candidate
+        await bucket_mgr.update(new_bucket_id, dream_candidate=True)
+    except Exception as e:
+        logger.error(f"Failed to create dream candidate from comment: {e}")
+        # non-fatal, comment was still added to dream
+        
+    return JSONResponse({"ok": True, "comment": new_comment})
+
+
+@mcp.custom_route("/api/upload", methods=["POST"])
+async def api_upload(request):
+    """Upload an attachment (e.g. image for vision, text file, or pdf)."""
+    from starlette.responses import JSONResponse
+    import shutil
+    
+    try:
+        form = await request.form()
+        if "file" not in form:
+            return JSONResponse({"error": "No file field found"}, status_code=400)
+            
+        upload_file = form["file"]
+        
+        # Basic validation
+        filename = upload_file.filename
+        if not filename:
+            return JSONResponse({"error": "Empty filename"}, status_code=400)
+            
+        ext = os.path.splitext(filename)[1].lower()
+        allowed_exts = [
+            ".jpg", ".jpeg", ".png", ".webp", ".gif",
+            ".txt", ".md", ".py", ".js", ".json", ".csv",
+            ".pdf", ".html", ".css", ".yaml", ".yml"
+        ]
+        if ext not in allowed_exts:
+            return JSONResponse({"error": f"Unsupported file type: {ext}"}, status_code=400)
+            
+        # Generate unique filename
+        safe_name = f"{int(time.time())}_{secrets.token_hex(4)}{ext}"
+        filepath = os.path.join(attachments_dir, safe_name)
+        
+        # Save file to disk
+        with open(filepath, "wb") as buffer:
+            shutil.copyfileobj(upload_file.file, buffer)
+            
+        return JSONResponse({
+            "ok": True, 
+            "url": f"/attachments/{safe_name}",
+            "filename": safe_name
+        })
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/attachments/{filename}", methods=["GET"])
+async def serve_attachment(request):
+    """Serve uploaded attachments."""
+    from starlette.responses import FileResponse, JSONResponse
+    filename = request.path_params["filename"]
+    filepath = os.path.join(attachments_dir, filename)
+    
+    # Simple security check to prevent directory traversal
+    if os.path.dirname(os.path.normpath(filepath)) != attachments_dir:
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+        
+    if not os.path.exists(filepath):
+        return JSONResponse({"error": "File not found"}, status_code=404)
+        
+    return FileResponse(filepath)
+
+
+# ============================================================
+# Reading Space APIs
+# ============================================================
+
+@mcp.custom_route("/api/reading/upload", methods=["POST"])
+async def api_reading_upload(request):
+    """Upload a book (epub, pdf, txt, md) and parse chapters."""
+    from starlette.responses import JSONResponse
+    import shutil
+    import secrets
+    
+    try:
+        form = await request.form()
+        if "file" not in form:
+            return JSONResponse({"error": "No file field found"}, status_code=400)
+            
+        upload_file = form["file"]
+        filename = upload_file.filename
+        if not filename:
+            return JSONResponse({"error": "Empty filename"}, status_code=400)
+            
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in [".epub", ".pdf", ".txt", ".md"]:
+            return JSONResponse({"error": f"Unsupported file type: {ext}"}, status_code=400)
+            
+        # Create books folders
+        books_dir = os.path.join(config["buckets_dir"], "books")
+        books_uploaded_dir = os.path.join(books_dir, "uploaded")
+        books_parsed_dir = os.path.join(books_dir, "parsed")
+        os.makedirs(books_uploaded_dir, exist_ok=True)
+        os.makedirs(books_parsed_dir, exist_ok=True)
+        
+        # Save original file
+        book_id = f"book_{int(time.time())}_{secrets.token_hex(4)}"
+        original_path = os.path.join(books_uploaded_dir, f"{book_id}{ext}")
+        with open(original_path, "wb") as buffer:
+            shutil.copyfileobj(upload_file.file, buffer)
+            
+        # Parse the book
+        try:
+            parsed_data = parse_book(original_path, original_filename=filename)
+        except Exception as parse_err:
+            if os.path.exists(original_path):
+                os.remove(original_path)
+            logger.error(f"Failed to parse book: {parse_err}")
+            return JSONResponse({"error": f"Failed to parse book: {str(parse_err)}"}, status_code=400)
+        
+        # Save cover image if present
+        cover_bytes = parsed_data.pop("cover_bytes", None)
+        cover_ext = parsed_data.pop("cover_ext", None) or ".jpg"
+        cover_url = None
+        
+        if cover_bytes:
+            cover_filename = f"cover_{book_id}{cover_ext}"
+            cover_path = os.path.join(attachments_dir, cover_filename)
+            try:
+                with open(cover_path, "wb") as cf:
+                    cf.write(cover_bytes)
+                cover_url = f"/attachments/{cover_filename}"
+            except Exception as cover_err:
+                logger.error(f"Failed to save cover image: {cover_err}")
+        
+        # Add parsed metadata
+        parsed_data["id"] = book_id
+        parsed_data["filename"] = filename
+        parsed_data["extension"] = ext
+        parsed_data["cover_url"] = cover_url
+        parsed_data["created_at"] = datetime.now().isoformat()
+        parsed_data["archived"] = False
+        parsed_data["content_available"] = True
+        
+        # Save parsed JSON
+        parsed_json_path = os.path.join(books_parsed_dir, f"{book_id}.json")
+        with open(parsed_json_path, "w", encoding="utf-8") as f:
+            _json_lib.dump(parsed_data, f, ensure_ascii=False, indent=2)
+            
+        short_chapters = [{"title": ch["title"], "length": len(ch["content"])} for ch in parsed_data["chapters"]]
+        
+        return JSONResponse({
+            "ok": True,
+            "book": {
+                "id": book_id,
+                "title": parsed_data["title"],
+                "author": parsed_data["author"],
+                "filename": filename,
+                "extension": ext,
+                "cover_url": cover_url,
+                "created_at": parsed_data["created_at"],
+                "archived": False,
+                "archived_at": None,
+                "finished_at": None,
+                "content_available": True,
+                "chapters": short_chapters
+            }
+        })
+    except Exception as e:
+        logger.error(f"Reading upload failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading/books", methods=["GET"])
+async def api_reading_books(request):
+    """List parsed books."""
+    from starlette.responses import JSONResponse
+    books_dir = os.path.join(config["buckets_dir"], "books")
+    books_parsed_dir = os.path.join(books_dir, "parsed")
+    if not os.path.exists(books_parsed_dir):
+        return JSONResponse([])
+        
+    progress_dict = {}
+    progress_path = os.path.join(books_dir, "progress.json")
+    if os.path.exists(progress_path):
+        try:
+            with open(progress_path, "r", encoding="utf-8") as f:
+                progress_dict = _json_lib.load(f)
+        except Exception as e:
+            logger.warning(f"Error loading reading progress: {e}")
+
+    books = []
+    for filename in os.listdir(books_parsed_dir):
+        if not filename.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(books_parsed_dir, filename), "r", encoding="utf-8") as f:
+                data = _json_lib.load(f)
+                short_chapters = [
+                    {
+                        "title": ch.get("title", "Chapter"),
+                        "length": ch.get("length", len(ch.get("content", ""))),
+                    }
+                    for ch in data.get("chapters", [])
+                ]
+                books.append({
+                    "id": data["id"],
+                    "title": data["title"],
+                    "author": data["author"],
+                    "filename": data.get("filename", ""),
+                    "extension": data.get("extension", ""),
+                    "cover_url": data.get("cover_url", None),
+                    "created_at": data.get("created_at", ""),
+                    "archived": data.get("archived", False),
+                    "archived_at": data.get("archived_at"),
+                    "finished_at": data.get("finished_at"),
+                    "content_available": data.get("content_available", True),
+                    "chapters": short_chapters,
+                    "progress": progress_dict.get(data["id"])
+                })
+        except Exception as e:
+            logger.warning(f"Error loading parsed book {filename}: {e}")
+            
+    books.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return JSONResponse(books)
+
+
+@mcp.custom_route("/api/reading/books/{book_id}", methods=["GET"])
+async def api_reading_book_details(request):
+    """Get book metadata details."""
+    from starlette.responses import JSONResponse
+    book_id = request.path_params["book_id"]
+    books_dir = os.path.join(config["buckets_dir"], "books")
+    books_parsed_dir = os.path.join(books_dir, "parsed")
+    book_path = os.path.join(books_parsed_dir, f"{book_id}.json")
+    if not os.path.exists(book_path):
+        return JSONResponse({"error": "Book not found"}, status_code=404)
+        
+    try:
+        with open(book_path, "r", encoding="utf-8") as f:
+            data = _json_lib.load(f)
+            short_chapters = [
+                {
+                    "title": ch.get("title", "Chapter"),
+                    "length": ch.get("length", len(ch.get("content", ""))),
+                }
+                for ch in data.get("chapters", [])
+            ]
+            return JSONResponse({
+                "id": data["id"],
+                "title": data["title"],
+                "author": data["author"],
+                "filename": data.get("filename", ""),
+                "extension": data.get("extension", ""),
+                "cover_url": data.get("cover_url", None),
+                "created_at": data.get("created_at", ""),
+                "archived": data.get("archived", False),
+                "archived_at": data.get("archived_at"),
+                "finished_at": data.get("finished_at"),
+                "content_available": data.get("content_available", True),
+                "chapters": short_chapters
+            })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading/books/{book_id}", methods=["PUT"])
+async def api_reading_book_update(request):
+    """Update book metadata (title, author)."""
+    from starlette.responses import JSONResponse
+    book_id = request.path_params["book_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        
+    books_dir = os.path.join(config["buckets_dir"], "books")
+    books_parsed_dir = os.path.join(books_dir, "parsed")
+    book_json_path = os.path.join(books_parsed_dir, f"{book_id}.json")
+    
+    if not os.path.exists(book_json_path):
+        return JSONResponse({"error": "Book not found"}, status_code=404)
+        
+    try:
+        with open(book_json_path, "r", encoding="utf-8") as f:
+            book_data = _json_lib.load(f)
+            
+        if "title" in body:
+            book_data["title"] = body["title"].strip()
+        if "author" in body:
+            book_data["author"] = body["author"].strip()
+            
+        with open(book_json_path, "w", encoding="utf-8") as f:
+            _json_lib.dump(book_data, f, ensure_ascii=False, indent=2)
+            
+        return JSONResponse({
+            "ok": True,
+            "book": {
+                "id": book_data["id"],
+                "title": book_data["title"],
+                "author": book_data["author"],
+                "filename": book_data.get("filename", ""),
+                "extension": book_data.get("extension", ""),
+                "cover_url": book_data.get("cover_url", None),
+                "created_at": book_data.get("created_at", "")
+            }
+        })
+    except Exception as e:
+        logger.error(f"Failed to update book: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading/books/{book_id}/archive", methods=["POST"])
+async def api_reading_book_archive(request):
+    """Archive a book's content while keeping metadata, cover, progress, and notes."""
+    from starlette.responses import JSONResponse
+    book_id = request.path_params["book_id"]
+    
+    books_dir = os.path.join(config["buckets_dir"], "books")
+    books_uploaded_dir = os.path.join(books_dir, "uploaded")
+    books_parsed_dir = os.path.join(books_dir, "parsed")
+    
+    book_json_path = os.path.join(books_parsed_dir, f"{book_id}.json")
+    if not os.path.exists(book_json_path):
+        return JSONResponse({"error": "Book not found"}, status_code=404)
+        
+    try:
+        with open(book_json_path, "r", encoding="utf-8") as f:
+            book_data = _json_lib.load(f)
+            
+        ext = book_data.get("extension", "")
+
+        if book_data.get("archived", False):
+            return JSONResponse({"ok": True, "book": book_data})
+
+        # 1. Delete original file.
+        if ext:
+            original_file_path = os.path.join(books_uploaded_dir, f"{book_id}{ext}")
+            if os.path.exists(original_file_path):
+                os.remove(original_file_path)
+                
+        # 2. Keep chapter labels for display, but remove all readable content.
+        book_data["chapters"] = [
+            {
+                "title": chapter.get("title", "Chapter"),
+                "length": chapter.get("length", len(chapter.get("content", ""))),
+            }
+            for chapter in book_data.get("chapters", [])
+        ]
+        archived_at = datetime.now().isoformat()
+        book_data["archived"] = True
+        book_data["archived_at"] = archived_at
+        book_data["finished_at"] = archived_at
+        book_data["content_available"] = False
+
+        with open(book_json_path, "w", encoding="utf-8") as f:
+            _json_lib.dump(book_data, f, ensure_ascii=False, indent=2)
+
+        return JSONResponse({
+            "ok": True,
+            "book": {
+                "id": book_data["id"],
+                "title": book_data["title"],
+                "author": book_data["author"],
+                "filename": book_data.get("filename", ""),
+                "extension": book_data.get("extension", ""),
+                "cover_url": book_data.get("cover_url"),
+                "created_at": book_data.get("created_at", ""),
+                "archived": True,
+                "archived_at": archived_at,
+                "finished_at": archived_at,
+                "content_available": False,
+                "chapters": book_data["chapters"],
+            },
+        })
+    except Exception as e:
+        logger.error(f"Failed to delete book: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading/books/{book_id}", methods=["DELETE"])
+async def api_reading_book_delete(request):
+    """Permanently delete a book, its files, progress, cover, and linked notes."""
+    from starlette.responses import JSONResponse
+    book_id = request.path_params["book_id"]
+
+    books_dir = os.path.join(config["buckets_dir"], "books")
+    books_uploaded_dir = os.path.join(books_dir, "uploaded")
+    books_parsed_dir = os.path.join(books_dir, "parsed")
+    book_json_path = os.path.join(books_parsed_dir, f"{book_id}.json")
+    if not os.path.exists(book_json_path):
+        return JSONResponse({"error": "Book not found"}, status_code=404)
+
+    try:
+        with open(book_json_path, "r", encoding="utf-8") as f:
+            book_data = _json_lib.load(f)
+
+        ext = book_data.get("extension", "")
+        if ext:
+            original_file_path = os.path.join(books_uploaded_dir, f"{book_id}{ext}")
+            if os.path.exists(original_file_path):
+                os.remove(original_file_path)
+
+        cover_url = book_data.get("cover_url", "")
+        if cover_url and cover_url.startswith("/attachments/"):
+            cover_filename = cover_url.replace("/attachments/", "")
+            cover_file_path = os.path.join(attachments_dir, cover_filename)
+            if os.path.exists(cover_file_path):
+                os.remove(cover_file_path)
+
+        os.remove(book_json_path)
+
+        progress_path = os.path.join(books_dir, "progress.json")
+        if os.path.exists(progress_path):
+            with open(progress_path, "r", encoding="utf-8") as f:
+                progress_dict = _json_lib.load(f)
+            if book_id in progress_dict:
+                del progress_dict[book_id]
+                with open(progress_path, "w", encoding="utf-8") as f:
+                    _json_lib.dump(progress_dict, f, ensure_ascii=False, indent=2)
+
+        bookmarks = _load_reading_bookmarks()
+        retained_bookmarks = [
+            bookmark for bookmark in bookmarks
+            if bookmark.get("book_id") != book_id
+        ]
+        if len(retained_bookmarks) != len(bookmarks):
+            _save_reading_bookmarks(retained_bookmarks)
+
+        deleted_notes = 0
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        for bucket in all_buckets:
+            meta = bucket.get("metadata", {})
+            is_reading_note = (
+                meta.get("source") == "reading_comment"
+                or "阅读" in meta.get("domain", [])
+                or "reading" in meta.get("domain", [])
+            )
+            if is_reading_note and meta.get("book_id") == book_id:
+                if await bucket_mgr.delete(bucket["id"]):
+                    deleted_notes += 1
+
+        return JSONResponse({"ok": True, "deleted_notes": deleted_notes})
+    except Exception as e:
+        logger.error(f"Failed to permanently delete book: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading/books/{book_id}/chapters/{chapter_idx}", methods=["GET"])
+async def api_reading_chapter_content(request):
+    """Get content of a specific chapter."""
+    from starlette.responses import JSONResponse
+    book_id = request.path_params["book_id"]
+    try:
+        chapter_idx = int(request.path_params["chapter_idx"])
+    except ValueError:
+        return JSONResponse({"error": "Invalid chapter index"}, status_code=400)
+        
+    books_dir = os.path.join(config["buckets_dir"], "books")
+    books_parsed_dir = os.path.join(books_dir, "parsed")
+    book_path = os.path.join(books_parsed_dir, f"{book_id}.json")
+    if not os.path.exists(book_path):
+        return JSONResponse({"error": "Book not found"}, status_code=404)
+        
+    try:
+        with open(book_path, "r", encoding="utf-8") as f:
+            data = _json_lib.load(f)
+            if data.get("archived", False) or not data.get("content_available", True):
+                return JSONResponse({"error": "Book content is archived"}, status_code=410)
+            chapters = data.get("chapters", [])
+            if chapter_idx < 0 or chapter_idx >= len(chapters):
+                return JSONResponse({"error": "Chapter index out of range"}, status_code=404)
+                
+            return JSONResponse(chapters[chapter_idx])
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading/books/{book_id}/progress", methods=["POST"])
+async def api_reading_progress_save(request):
+    """Save reading progress for a book."""
+    from starlette.responses import JSONResponse
+    book_id = request.path_params["book_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        
+    chapter_idx = body.get("chapter_idx", 0)
+    percentage = body.get("percentage", 0.0)
+    last_read_position = body.get("last_read_position", "")
+    
+    try:
+        books_dir = os.path.join(config["buckets_dir"], "books")
+        os.makedirs(books_dir, exist_ok=True)
+        progress_path = os.path.join(books_dir, "progress.json")
+        
+        progress_dict = {}
+        if os.path.exists(progress_path):
+            try:
+                with open(progress_path, "r", encoding="utf-8") as f:
+                    progress_dict = _json_lib.load(f)
+            except Exception:
+                pass
+                
+        progress_dict[book_id] = {
+            "chapter_idx": chapter_idx,
+            "percentage": percentage,
+            "last_read_position": last_read_position,
+            "updated_at": datetime.now().isoformat()
+        }
+        
+        with open(progress_path, "w", encoding="utf-8") as f:
+            _json_lib.dump(progress_dict, f, ensure_ascii=False, indent=2)
+            
+        return JSONResponse({"ok": True, "progress": progress_dict[book_id]})
+    except Exception as e:
+        logger.error(f"Failed to save reading progress: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading/books/{book_id}/progress", methods=["GET"])
+async def api_reading_progress_get(request):
+    """Get reading progress for a specific book."""
+    from starlette.responses import JSONResponse
+    book_id = request.path_params["book_id"]
+    
+    books_dir = os.path.join(config["buckets_dir"], "books")
+    progress_path = os.path.join(books_dir, "progress.json")
+    if not os.path.exists(progress_path):
+        return JSONResponse({"progress": None})
+        
+    try:
+        with open(progress_path, "r", encoding="utf-8") as f:
+            progress_dict = _json_lib.load(f)
+            progress = progress_dict.get(book_id)
+            return JSONResponse({"progress": progress})
+    except Exception as e:
+        logger.error(f"Failed to get reading progress: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading/progress/recent", methods=["GET"])
+async def api_reading_progress_recent(request):
+    """Get the most recently read book and its progress."""
+    from starlette.responses import JSONResponse
+    books_dir = os.path.join(config["buckets_dir"], "books")
+    progress_path = os.path.join(books_dir, "progress.json")
+    books_parsed_dir = os.path.join(books_dir, "parsed")
+    
+    if not os.path.exists(progress_path):
+        return JSONResponse({"recent": None})
+        
+    try:
+        with open(progress_path, "r", encoding="utf-8") as f:
+            progress_dict = _json_lib.load(f)
+            
+        if not progress_dict:
+            return JSONResponse({"recent": None})
+            
+        sorted_progress = sorted(
+            progress_dict.items(),
+            key=lambda item: item[1].get("updated_at", ""),
+            reverse=True
+        )
+        
+        recent_book_id = None
+        progress_data = None
+        book_data = None
+        for candidate_book_id, candidate_progress in sorted_progress:
+            book_json_path = os.path.join(books_parsed_dir, f"{candidate_book_id}.json")
+            if not os.path.exists(book_json_path):
+                continue
+            with open(book_json_path, "r", encoding="utf-8") as f:
+                candidate_book = _json_lib.load(f)
+            if candidate_book.get("archived", False):
+                continue
+            recent_book_id = candidate_book_id
+            progress_data = candidate_progress
+            book_data = candidate_book
+            break
+
+        if not recent_book_id or not book_data or progress_data is None:
+            return JSONResponse({"recent": None})
+            
+        short_chapters = [{"title": ch["title"], "length": len(ch["content"])} for ch in book_data.get("chapters", [])]
+        
+        return JSONResponse({
+            "recent": {
+                "book": {
+                    "id": book_data["id"],
+                    "title": book_data["title"],
+                    "author": book_data["author"],
+                    "filename": book_data.get("filename", ""),
+                    "extension": book_data.get("extension", ""),
+                    "cover_url": book_data.get("cover_url", None),
+                    "created_at": book_data.get("created_at", ""),
+                    "archived": False,
+                    "archived_at": None,
+                    "finished_at": book_data.get("finished_at"),
+                    "content_available": True,
+                    "chapters": short_chapters
+                },
+                "progress": progress_data
+            }
+        })
+    except Exception as e:
+        logger.error(f"Failed to get recent reading progress: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def _reading_bookmarks_path():
+    books_dir = os.path.join(config["buckets_dir"], "books")
+    os.makedirs(books_dir, exist_ok=True)
+    return os.path.join(books_dir, "bookmarks.json")
+
+
+def _load_reading_bookmarks():
+    bookmarks_path = _reading_bookmarks_path()
+    if not os.path.exists(bookmarks_path):
+        return []
+    try:
+        with open(bookmarks_path, "r", encoding="utf-8") as f:
+            data = _json_lib.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning(f"Failed to load reading bookmarks: {e}")
+        return []
+
+
+def _save_reading_bookmarks(bookmarks):
+    with open(_reading_bookmarks_path(), "w", encoding="utf-8") as f:
+        _json_lib.dump(bookmarks, f, ensure_ascii=False, indent=2)
+
+
+def _optional_nonnegative_int(value):
+    if value is None or value == "":
+        return None
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError("position must be non-negative")
+    return parsed
+
+
+@mcp.custom_route("/api/reading/bookmarks", methods=["GET"])
+async def api_reading_bookmarks_list(request):
+    """List bookmarks, optionally filtered by book_id."""
+    from starlette.responses import JSONResponse
+    book_filter = request.query_params.get("book_id")
+    bookmarks = _load_reading_bookmarks()
+    if book_filter:
+        bookmarks = [
+            bookmark for bookmark in bookmarks
+            if bookmark.get("book_id") == book_filter
+        ]
+    bookmarks.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return JSONResponse(bookmarks)
+
+
+@mcp.custom_route("/api/reading/bookmarks", methods=["POST"])
+async def api_reading_bookmark_create(request):
+    """Create a stable text-position bookmark."""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    book_id = str(body.get("book_id", "")).strip()
+    book_name = str(body.get("book_name", "")).strip()
+    chapter = str(body.get("chapter", "")).strip()
+    excerpt = str(body.get("excerpt", "")).strip()
+    try:
+        chapter_idx = int(body.get("chapter_idx"))
+        character_offset = int(body.get("character_offset"))
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"error": "chapter_idx and character_offset must be integers"},
+            status_code=400,
+        )
+    if not book_id or not book_name or chapter_idx < 0 or character_offset < 0:
+        return JSONResponse(
+            {"error": "book_id, book_name, and non-negative positions are required"},
+            status_code=400,
+        )
+
+    bookmarks = _load_reading_bookmarks()
+    duplicate = next((
+        bookmark for bookmark in bookmarks
+        if bookmark.get("book_id") == book_id
+        and bookmark.get("chapter_idx") == chapter_idx
+        and bookmark.get("character_offset") == character_offset
+    ), None)
+    if duplicate:
+        return JSONResponse({"ok": True, "bookmark": duplicate})
+
+    bookmark = {
+        "id": f"bookmark_{int(time.time() * 1000)}_{secrets.token_hex(4)}",
+        "book_id": book_id,
+        "book_name": book_name,
+        "chapter": chapter,
+        "chapter_idx": chapter_idx,
+        "character_offset": character_offset,
+        "excerpt": excerpt,
+        "created_at": datetime.now().isoformat(),
+    }
+    bookmarks.append(bookmark)
+    _save_reading_bookmarks(bookmarks)
+    return JSONResponse({"ok": True, "bookmark": bookmark})
+
+
+@mcp.custom_route("/api/reading/bookmarks/{bookmark_id}", methods=["DELETE"])
+async def api_reading_bookmark_delete(request):
+    """Delete a reading bookmark."""
+    from starlette.responses import JSONResponse
+    bookmark_id = request.path_params["bookmark_id"]
+    bookmarks = _load_reading_bookmarks()
+    retained = [
+        bookmark for bookmark in bookmarks
+        if bookmark.get("id") != bookmark_id
+    ]
+    if len(retained) == len(bookmarks):
+        return JSONResponse({"error": "Bookmark not found"}, status_code=404)
+    _save_reading_bookmarks(retained)
+    return JSONResponse({"ok": True})
+
+
+@mcp.custom_route("/api/reading/featured-quote", methods=["GET"])
+async def api_reading_featured_quote(request):
+    """Retrieve a featured reading quote (random or latest comment quote)."""
+    from starlette.responses import JSONResponse
+    import random
+    
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        quotes = []
+        for b in all_buckets:
+            meta = b.get("metadata", {})
+            if "阅读" in meta.get("domain", []) or "reading" in meta.get("domain", []):
+                original = meta.get("original", "").strip()
+                if original:
+                    category = reading_category_from_metadata(meta)
+                    quotes.append({
+                        "id": b["id"],
+                        "book_id": meta.get("book_id", ""),
+                        "book_name": meta.get("book_name", ""),
+                        "chapter": meta.get("chapter", ""),
+                        "chapter_idx": meta.get("chapter_idx"),
+                        "character_offset": meta.get("character_offset"),
+                        "original": original,
+                        "comment": meta.get("comment", ""),
+                        "category": category,
+                        "flag": meta.get("flag", "") or (
+                            CATEGORY_TO_LEGACY_FLAG.get(category, "") if category else ""
+                        ),
+                        "dream_candidate": meta.get("dream_candidate", False),
+                        "created_at": meta.get("created", "")
+                    })
+        
+        if not quotes:
+            return JSONResponse({"quote": None})
+            
+        featured = random.choice(quotes)
+        return JSONResponse({"quote": featured})
+    except Exception as e:
+        logger.error(f"Failed to get featured quote: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading/comments", methods=["POST"])
+async def api_reading_comment_create(request):
+    """Create a reading comment and save it to the memory bucket."""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        
+    book_id = body.get("book_id", "").strip()
+    book_name = body.get("book_name", "").strip()
+    chapter = body.get("chapter", "").strip()
+    original = body.get("original", "").strip()
+    comment = body.get("comment", "").strip()
+    try:
+        chapter_idx = _optional_nonnegative_int(body.get("chapter_idx"))
+        character_offset = _optional_nonnegative_int(body.get("character_offset"))
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"error": "chapter_idx and character_offset must be non-negative integers or null"},
+            status_code=400,
+        )
+    raw_category = body.get("category", body.get("flag"))
+    category = normalize_reading_category(raw_category)
+    if raw_category is not None and str(raw_category).strip() and not category:
+        return JSONResponse(
+            {"error": "category must be discuss, resonance, question, or null"},
+            status_code=400,
+        )
+    legacy_flag = CATEGORY_TO_LEGACY_FLAG.get(category, "") if category else ""
+    
+    if not book_name or not comment:
+        return JSONResponse({"error": "book_name and comment are required"}, status_code=400)
+        
+    # Format in English prompt structure
+    category_label = f" [Category: {category}]" if category else ""
+    formatted_content = (
+        "【Reading Comment】\n"
+        f"- Book: 《{book_name}》 {chapter}\n"
+        f"- Original: \"{original}\"\n"
+        f"- Ciel's Comment: {comment}{category_label}"
+    )
+    
+    try:
+        # Create a dynamic bucket directly
+        bucket_id = await bucket_mgr.create(
+            content=formatted_content,
+            domain=["阅读", "Reading"],
+            importance=5,
+            valence=0.5,
+            arousal=0.3,
+            bucket_type="dynamic",
+            name=f"Reading comment on {book_name}",
+            source="reading_comment",
+        )
+        
+        # Populate the extra metadata fields
+        dream_cand = category in ("resonance", "question")
+        await bucket_mgr.update(
+            bucket_id,
+            book_id=book_id,
+            book_name=book_name,
+            chapter=chapter,
+            chapter_idx=chapter_idx,
+            character_offset=character_offset,
+            original=original,
+            comment=comment,
+            category=category or "",
+            flag=legacy_flag,
+            dream_candidate=dream_cand
+        )
+        
+        # Build embedding in background
+        if embedding_engine and embedding_engine.enabled:
+            asyncio.create_task(embedding_engine.generate_and_store(bucket_id, formatted_content))
+            
+        return JSONResponse({
+            "ok": True,
+            "comment": {
+                "id": bucket_id,
+                "book_id": book_id,
+                "book_name": book_name,
+                "chapter": chapter,
+                "chapter_idx": chapter_idx,
+                "character_offset": character_offset,
+                "original": original,
+                "comment": comment,
+                "category": category,
+                "flag": legacy_flag or None,
+                "dream_candidate": dream_cand,
+                "created_at": datetime.now().isoformat()
+            }
+        })
+    except Exception as e:
+        logger.error(f"Failed to create reading comment: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading/comments", methods=["GET"])
+async def api_reading_comments_list(request):
+    """List reading comments (can filter by book_id)."""
+    from starlette.responses import JSONResponse
+    book_filter = request.query_params.get("book_id")
+    
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        comments = []
+        for b in all_buckets:
+            meta = b.get("metadata", {})
+            if "阅读" in meta.get("domain", []) or "reading" in meta.get("domain", []):
+                # Filter by book_id if provided
+                if book_filter and meta.get("book_id") != book_filter:
+                    continue
+                    
+                category = reading_category_from_metadata(meta)
+                comments.append({
+                    "id": b["id"],
+                    "book_id": meta.get("book_id", ""),
+                    "book_name": meta.get("book_name", ""),
+                    "chapter": meta.get("chapter", ""),
+                    "chapter_idx": meta.get("chapter_idx"),
+                    "character_offset": meta.get("character_offset"),
+                    "original": meta.get("original", ""),
+                    "comment": meta.get("comment", b["content"]),
+                    "category": category,
+                    "flag": meta.get("flag", "") or (
+                        CATEGORY_TO_LEGACY_FLAG.get(category, "") if category else ""
+                    ),
+                    "dream_candidate": meta.get("dream_candidate", False),
+                    "created_at": meta.get("created", "")
+                })
+        
+        # Sort by created_at desc
+        comments.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        return JSONResponse(comments)
+    except Exception as e:
+        logger.error(f"Failed to list reading comments: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading/comments/{comment_id}", methods=["PUT"])
+async def api_reading_comment_update(request):
+    """Update a reading comment's text, quote, or stable category."""
+    from starlette.responses import JSONResponse
+    comment_id = request.path_params["comment_id"]
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    try:
+        bucket = await bucket_mgr.get(comment_id)
+        if not bucket:
+            return JSONResponse({"error": "Comment not found"}, status_code=404)
+
+        meta = bucket.get("metadata", {})
+        if "阅读" not in meta.get("domain", []) and "reading" not in meta.get("domain", []):
+            return JSONResponse({"error": "Not a reading comment bucket"}, status_code=400)
+
+        comment = str(body.get("comment", meta.get("comment", ""))).strip()
+        original = str(body.get("original", meta.get("original", ""))).strip()
+        if not comment:
+            return JSONResponse({"error": "comment is required"}, status_code=400)
+
+        category = reading_category_from_metadata(meta)
+        if "category" in body or "flag" in body:
+            raw_category = body.get("category", body.get("flag"))
+            category = normalize_reading_category(raw_category)
+            if raw_category is not None and str(raw_category).strip() and not category:
+                return JSONResponse(
+                    {"error": "category must be discuss, resonance, question, or null"},
+                    status_code=400,
+                )
+
+        chapter_idx = meta.get("chapter_idx")
+        character_offset = meta.get("character_offset")
+        try:
+            if "chapter_idx" in body:
+                chapter_idx = _optional_nonnegative_int(body.get("chapter_idx"))
+            if "character_offset" in body:
+                character_offset = _optional_nonnegative_int(body.get("character_offset"))
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "chapter_idx and character_offset must be non-negative integers or null"},
+                status_code=400,
+            )
+
+        legacy_flag = CATEGORY_TO_LEGACY_FLAG.get(category, "") if category else ""
+        dream_cand = category in ("resonance", "question")
+        category_label = f" [Category: {category}]" if category else ""
+        formatted_content = (
+            "【Reading Comment】\n"
+            f"- Book: 《{meta.get('book_name', '')}》 {meta.get('chapter', '')}\n"
+            f"- Original: \"{original}\"\n"
+            f"- Ciel's Comment: {comment}{category_label}"
+        )
+
+        success = await bucket_mgr.update(
+            comment_id,
+            content=formatted_content,
+            original=original,
+            comment=comment,
+            chapter_idx=chapter_idx,
+            character_offset=character_offset,
+            category=category or "",
+            flag=legacy_flag,
+            dream_candidate=dream_cand,
+        )
+        if not success:
+            return JSONResponse({"error": "Failed to update comment"}, status_code=500)
+
+        updated = await bucket_mgr.get(comment_id)
+        updated_meta = updated.get("metadata", {})
+        return JSONResponse({
+            "ok": True,
+            "comment": {
+                "id": comment_id,
+                "book_id": updated_meta.get("book_id", ""),
+                "book_name": updated_meta.get("book_name", ""),
+                "chapter": updated_meta.get("chapter", ""),
+                "chapter_idx": updated_meta.get("chapter_idx"),
+                "character_offset": updated_meta.get("character_offset"),
+                "original": original,
+                "comment": comment,
+                "category": category,
+                "flag": legacy_flag or None,
+                "dream_candidate": dream_cand,
+                "created_at": updated_meta.get("created", ""),
+            },
+        })
+    except Exception as e:
+        logger.error(f"Failed to update reading comment: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading/comments/{comment_id}", methods=["DELETE"])
+async def api_reading_comment_delete(request):
+    """Delete a reading comment bucket."""
+    from starlette.responses import JSONResponse
+    comment_id = request.path_params["comment_id"]
+    
+    try:
+        bucket = await bucket_mgr.get(comment_id)
+        if not bucket:
+            return JSONResponse({"error": "Comment not found"}, status_code=404)
+            
+        meta = bucket.get("metadata", {})
+        if "阅读" not in meta.get("domain", []) and "reading" not in meta.get("domain", []):
+            return JSONResponse({"error": "Not a reading comment bucket"}, status_code=400)
+            
+        success = await bucket_mgr.delete(comment_id)
+        if success:
+            return JSONResponse({"ok": True})
+        else:
+            return JSONResponse({"error": "Failed to delete from memory"}, status_code=500)
+    except Exception as e:
+        logger.error(f"Failed to delete reading comment: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/dream-candidates", methods=["GET"])
+async def api_dream_candidates_get(request):
+    """List all dynamic memory buckets flagged as dream candidates."""
+    from starlette.responses import JSONResponse
+    try:
+        candidates = await bucket_mgr.list_dream_candidates(limit=100)
+        result = []
+        for b in candidates:
+            meta = b.get("metadata", {})
+            result.append({
+                "id": b["id"],
+                "name": meta.get("name", b["id"]),
+                "content": strip_wikilinks(b.get("content", "")),
+                "created": meta.get("created", ""),
+            })
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/dream-candidates/{bucket_id}", methods=["DELETE"])
+async def api_dream_candidate_delete(request):
+    """Delete a memory bucket by ID."""
+    from starlette.responses import JSONResponse
+    bucket_id = request.path_params["bucket_id"]
+    try:
+        success = await bucket_mgr.delete(bucket_id)
+        return JSONResponse({"ok": success})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @mcp.custom_route("/api/push/subscribe", methods=["POST"])
@@ -2057,7 +4799,7 @@ async def api_push_public_key(request):
 # Dashboard API endpoints (for lightweight Web UI)
 # 仪表板 API（轻量 Web UI 用）
 # =============================================================
-@mcp.custom_route("/api/buckets", methods=["GET"])
+@mcp.custom_route("/api/dashboard/buckets", methods=["GET"])
 async def api_buckets(request):
     """List all buckets with metadata (no content for efficiency)."""
     from starlette.responses import JSONResponse
@@ -2263,6 +5005,32 @@ async def api_breath_debug(request):
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+# --- Token Usage Stats APIs ---
+
+@mcp.custom_route("/api/stats/usage", methods=["GET"])
+async def api_stats_usage(request):
+    """Get daily token usage stats."""
+    from starlette.responses import JSONResponse
+    try:
+        days = int(request.query_params.get("days", 7))
+        from usage_tracker import get_tracker
+        stats = get_tracker().get_daily_usage(days=days)
+        return JSONResponse({"status": "ok", "days": days, "data": stats})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/stats/savings", methods=["GET"])
+async def api_stats_savings(request):
+    """Get overall cache savings stats."""
+    from starlette.responses import JSONResponse
+    try:
+        days = int(request.query_params.get("days", 30))
+        from usage_tracker import get_tracker
+        stats = get_tracker().get_savings_stats(days=days)
+        return JSONResponse({"status": "ok", "days": days, "data": stats})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @mcp.custom_route("/dashboard", methods=["GET"])
@@ -2285,16 +5053,42 @@ async def api_config_get(request):
     err = _require_auth(request)
     if err: return err
     dehy = config.get("dehydration", {})
+    awk = config.get("awakening", {})
+    drm = config.get("dreaming", {})
     emb = config.get("embedding", {})
-    api_key = dehy.get("api_key", "")
-    masked_key = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else ("***" if api_key else "")
+    chat_cfg = config.get("chat", {})
+    
+    def mask(k):
+        return f"{k[:4]}...{k[-4:]}" if len(k) > 8 else ("***" if k else "")
+        
     return JSONResponse({
         "dehydration": {
             "model": dehy.get("model", ""),
             "base_url": dehy.get("base_url", ""),
-            "api_key_masked": masked_key,
+            "api_key_masked": mask(dehy.get("api_key", "")),
             "max_tokens": dehy.get("max_tokens", 1024),
             "temperature": dehy.get("temperature", 0.1),
+        },
+        "awakening": {
+            "model": awk.get("model", ""),
+            "base_url": awk.get("base_url", ""),
+            "api_key_masked": mask(awk.get("api_key", "")),
+            "max_tokens": awk.get("max_tokens", 1024),
+            "temperature": awk.get("temperature", 0.8),
+        },
+        "dreaming": {
+            "model": drm.get("model", ""),
+            "base_url": drm.get("base_url", ""),
+            "api_key_masked": mask(drm.get("api_key", "")),
+            "max_tokens": drm.get("max_tokens", 2048),
+            "temperature": drm.get("temperature", 0.2),
+        },
+        "chat": {
+            "model": chat_cfg.get("model", ""),
+            "base_url": chat_cfg.get("base_url", ""),
+            "api_key_masked": mask(chat_cfg.get("api_key", "")),
+            "max_tokens": chat_cfg.get("max_tokens", 1024),
+            "temperature": chat_cfg.get("temperature", 0.7),
         },
         "embedding": {
             "enabled": emb.get("enabled", False),
@@ -2336,12 +5130,84 @@ async def api_config_update(request):
         dehydrator.model = dehy.get("model", "deepseek-chat")
         dehydrator.base_url = dehy.get("base_url", "")
         dehydrator.api_key = dehy.get("api_key", "")
+        dehydrator.api_available = bool(dehydrator.api_key)
         if hasattr(dehydrator, "client") and dehydrator.api_key:
             from openai import AsyncOpenAI
             dehydrator.client = AsyncOpenAI(
                 api_key=dehydrator.api_key,
                 base_url=dehydrator.base_url,
             )
+
+    # --- Awakening config ---
+    if "awakening" in body:
+        a = body["awakening"]
+        awk = config.setdefault("awakening", {})
+        for key in ("model", "base_url", "max_tokens", "temperature"):
+            if key in a:
+                awk[key] = a[key]
+                updated.append(f"awakening.{key}")
+        if "api_key" in a and a["api_key"]:
+            awk["api_key"] = a["api_key"]
+            updated.append("awakening.api_key")
+        # Hot-reload awakening_scheduler client
+        awakening_scheduler.model = awk.get("model", config.get("dehydration", {}).get("model", "deepseek-chat"))
+        awakening_scheduler.max_tokens = awk.get("max_tokens", 1024)
+        awakening_scheduler.temperature = awk.get("temperature", 0.8)
+        from openai import AsyncOpenAI
+        awakening_scheduler._client = AsyncOpenAI(
+            api_key=awk.get("api_key", config.get("dehydration", {}).get("api_key", "")),
+            base_url=awk.get("base_url", config.get("dehydration", {}).get("base_url", "")),
+        )
+
+    # --- Dreaming config ---
+    if "dreaming" in body:
+        drm_in = body["dreaming"]
+        drm = config.setdefault("dreaming", {})
+        for key in ("model", "base_url", "max_tokens", "temperature"):
+            if key in drm_in:
+                drm[key] = drm_in[key]
+                updated.append(f"dreaming.{key}")
+        if "api_key" in drm_in and drm_in["api_key"]:
+            drm["api_key"] = drm_in["api_key"]
+            updated.append("dreaming.api_key")
+        # Hot-reload dehydrator dreaming client
+        dehydrator.dream_model = drm.get("model", config.get("dehydration", {}).get("model", "deepseek-chat"))
+        dehydrator.dream_base_url = drm.get("base_url", config.get("dehydration", {}).get("base_url", ""))
+        dehydrator.dream_api_key = drm.get("api_key", config.get("dehydration", {}).get("api_key", ""))
+        dehydrator.dream_max_tokens = drm.get("max_tokens", 2048)
+        dehydrator.dream_temperature = drm.get("temperature", 0.2)
+        if dehydrator.dream_api_key:
+            from openai import AsyncOpenAI
+            dehydrator.dream_client = AsyncOpenAI(
+                api_key=dehydrator.dream_api_key,
+                base_url=dehydrator.dream_base_url,
+                timeout=120.0,
+            )
+        else:
+            dehydrator.dream_client = getattr(dehydrator, "client", None)
+
+    # --- Dedicated Chat config ---
+    if "chat" in body:
+        c = body["chat"]
+        chat_cfg = config.setdefault("chat", {})
+        for key in ("model", "base_url", "max_tokens", "temperature"):
+            if key in c:
+                chat_cfg[key] = c[key]
+                updated.append(f"chat.{key}")
+        if "api_key" in c and c["api_key"]:
+            chat_cfg["api_key"] = c["api_key"]
+            updated.append("chat.api_key")
+        # Hot-reload dedicated chat client
+        global chat_client
+        if chat_cfg.get("api_key"):
+            from openai import AsyncOpenAI
+            chat_client = AsyncOpenAI(
+                api_key=chat_cfg["api_key"],
+                base_url=chat_cfg.get("base_url") or None,
+                timeout=120.0,
+            )
+        else:
+            chat_client = None
 
     # --- Embedding config ---
     if "embedding" in body:
@@ -2380,7 +5246,37 @@ async def api_config_update(request):
                 for key in ("model", "base_url", "max_tokens", "temperature"):
                     if key in body["dehydration"]:
                         sc_dehy[key] = body["dehydration"][key]
-                # Never persist api_key to yaml (use env var)
+                        
+            if "awakening" in body:
+                sc_awk = save_config.setdefault("awakening", {})
+                for key in ("model", "base_url", "max_tokens", "temperature"):
+                    if key in body["awakening"]:
+                        sc_awk[key] = body["awakening"][key]
+                        
+            if "dreaming" in body:
+                sc_drm = save_config.setdefault("dreaming", {})
+                for key in ("model", "base_url", "max_tokens", "temperature"):
+                    if key in body["dreaming"]:
+                        sc_drm[key] = body["dreaming"][key]
+                # Never persist api_key to yaml (use env var or keep in memory if user wishes)
+                # But actually user configures API key from Dashboard so we might need to save it?
+                # The existing code says "Never persist api_key to yaml (use env var)", but if the user inputs it via the drawer, it will be kept in memory but lost on restart.
+                # Since this is local app, let's persist api_key if provided because env vars are hard for non-technical users.
+
+            if "chat" in body:
+                sc_chat = save_config.setdefault("chat", {})
+                for key in ("model", "base_url", "max_tokens", "temperature"):
+                    if key in body["chat"]:
+                        sc_chat[key] = body["chat"][key]
+            
+            if "dehydration" in body and "api_key" in body["dehydration"]:
+                save_config.setdefault("dehydration", {})["api_key"] = body["dehydration"]["api_key"]
+            if "awakening" in body and "api_key" in body["awakening"]:
+                save_config.setdefault("awakening", {})["api_key"] = body["awakening"]["api_key"]
+            if "dreaming" in body and "api_key" in body["dreaming"]:
+                save_config.setdefault("dreaming", {})["api_key"] = body["dreaming"]["api_key"]
+            if "chat" in body and "api_key" in body["chat"]:
+                save_config.setdefault("chat", {})["api_key"] = body["chat"]["api_key"]
 
             if "embedding" in body:
                 sc_emb = save_config.setdefault("embedding", {})
@@ -2401,6 +5297,47 @@ async def api_config_update(request):
             return JSONResponse({"error": f"persist failed: {e}", "updated": updated}, status_code=500)
 
     return JSONResponse({"updated": updated, "ok": True})
+
+
+@mcp.custom_route("/api/config/test", methods=["POST"])
+async def api_config_test(request):
+    """Test LLM API connection with provided credentials."""
+    from starlette.responses import JSONResponse
+    from openai import AsyncOpenAI
+    err = _require_auth(request)
+    if err: return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        
+    api_key = body.get("api_key", "").strip()
+    base_url = body.get("base_url", "").strip()
+    model = body.get("model", "").strip()
+    tab = body.get("tab", "dehydration").strip()
+    
+    if not api_key:
+        # fallback to the configured key for the requested tab, then dehydration
+        tab_cfg = config.get(tab, {})
+        api_key = tab_cfg.get("api_key", "")
+        if not api_key:
+            dehy = config.get("dehydration", {})
+            api_key = dehy.get("api_key", "")
+        
+    if not api_key:
+        return JSONResponse({"error": "Missing API Key"}, status_code=400)
+        
+    try:
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url or None, timeout=10.0)
+        response = await client.chat.completions.create(
+            model=model or "deepseek-chat",
+            messages=[{"role": "user", "content": "Ping. Respond with 'Pong'."}],
+            max_tokens=10
+        )
+        msg = response.choices[0].message.content
+        return JSONResponse({"ok": True, "message": msg})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # =============================================================
@@ -2832,6 +5769,226 @@ async def api_private_diary(request):
         return JSONResponse(payload)
     except Exception as e:
         logger.error(f"Private diary API failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ============================================================
+# Memory CMS APIs
+# ============================================================
+
+def _find_core_file(core_id: str) -> str | None:
+    if not core_id:
+        return None
+    core_dir = bucket_mgr.core_dir
+    if not os.path.exists(core_dir):
+        return None
+    for root, _, files in os.walk(core_dir):
+        for filename in files:
+            if not filename.endswith(".md"):
+                continue
+            stem = filename[:-3]
+            if stem == core_id or stem.endswith(f"_{core_id}"):
+                return os.path.join(root, filename)
+    return None
+
+
+@mcp.custom_route("/api/core-memories", methods=["GET"])
+async def api_core_memories_get(request):
+    """List core context entries from permanent/core/."""
+    from starlette.responses import JSONResponse
+    try:
+        entries = await bucket_mgr.list_core()
+        return JSONResponse({"ok": True, "entries": entries})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/core-memories", methods=["POST"])
+async def api_core_memories_post(request):
+    """Create a protected core context entry under permanent/core/."""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    name = str(body.get("name", "")).strip()
+    content = str(body.get("content", "")).strip()
+    if not content:
+        return JSONResponse({"error": "content is required"}, status_code=400)
+
+    core_id = generate_bucket_id()
+    title = name or "Core Memory"
+    try:
+        order = int(body.get("order", 999))
+    except Exception:
+        order = 999
+
+    metadata = {
+        "id": core_id,
+        "name": title,
+        "type": "core",
+        "source": "core_manual",
+        "protected": True,
+        "domain": ["core"],
+        "tags": body.get("tags", []),
+        "importance": 10,
+        "created": now_iso(),
+        "last_active": now_iso(),
+        "order": order,
+    }
+    since = str(body.get("since", "")).strip()
+    if since:
+        metadata["since"] = since
+
+    try:
+        os.makedirs(bucket_mgr.core_dir, exist_ok=True)
+        filename = f"{sanitize_name(title)}_{core_id}.md"
+        file_path = safe_path(bucket_mgr.core_dir, filename)
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(frontmatter.dumps(frontmatter.Post(content, **metadata)))
+        return JSONResponse({"ok": True, "entry": bucket_mgr._load_bucket(str(file_path))})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/core-memories/{core_id}", methods=["PUT"])
+async def api_core_memories_put(request):
+    """Update a core context entry."""
+    from starlette.responses import JSONResponse
+    core_id = request.path_params["core_id"]
+    file_path = _find_core_file(core_id)
+    if not file_path:
+        return JSONResponse({"error": "Core entry not found"}, status_code=404)
+
+    try:
+        body = await request.json()
+        post = frontmatter.load(file_path)
+        if "name" in body:
+            post["name"] = str(body.get("name") or post.get("name") or "Core Memory").strip()
+        if "tags" in body and isinstance(body["tags"], list):
+            post["tags"] = body["tags"]
+        if "order" in body:
+            try:
+                post["order"] = int(body["order"])
+            except Exception:
+                pass
+        if "since" in body:
+            since = str(body.get("since") or "").strip()
+            if since:
+                post["since"] = since
+            elif "since" in post.metadata:
+                del post.metadata["since"]
+        if "content" in body:
+            post.content = str(body.get("content") or "")
+        post["last_active"] = now_iso()
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(frontmatter.dumps(post))
+        return JSONResponse({"ok": True, "entry": bucket_mgr._load_bucket(file_path)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/core-memories/{core_id}", methods=["DELETE"])
+async def api_core_memories_delete(request):
+    """Delete a core context entry."""
+    from starlette.responses import JSONResponse
+    core_id = request.path_params["core_id"]
+    file_path = _find_core_file(core_id)
+    if not file_path:
+        return JSONResponse({"error": "Core entry not found"}, status_code=404)
+    try:
+        os.remove(file_path)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/buckets", methods=["GET"])
+async def api_buckets_get(request):
+    """Get all buckets for the CMS."""
+    from starlette.responses import JSONResponse
+    limit = int(request.query_params.get("limit", "100"))
+    b_type = request.query_params.get("type", None)
+    source = request.query_params.get("source", "").strip().lower()
+    scope = request.query_params.get("scope", "").strip().lower()
+    
+    # bucket_mgr.list_all returns all buckets across all domains
+    all_buckets = await bucket_mgr.list_all(include_archive=True)
+    
+    if b_type:
+        all_buckets = [b for b in all_buckets if b.get("metadata", {}).get("type") == b_type]
+    if source:
+        all_buckets = [
+            b for b in all_buckets
+            if str(b.get("metadata", {}).get("source", "")).strip().lower() == source
+        ]
+    if scope == "strata":
+        all_buckets = [
+            b for b in all_buckets
+            if b.get("metadata", {}).get("source") not in STRATA_EXCLUDED_SOURCES
+        ]
+        
+    # Sort by created timestamp descending
+    def get_time(b):
+        meta = b.get("metadata", {})
+        return meta.get("created") or meta.get("last_active") or "1970"
+        
+    all_buckets.sort(key=get_time, reverse=True)
+    return JSONResponse({"ok": True, "buckets": all_buckets[:limit]})
+
+
+@mcp.custom_route("/api/buckets/{bucket_id}", methods=["GET"])
+async def api_bucket_get(request):
+    """Get a specific bucket by ID."""
+    from starlette.responses import JSONResponse
+    bucket_id = request.path_params["bucket_id"]
+    try:
+        data = await bucket_mgr.get(bucket_id)
+        if data:
+            return JSONResponse({"ok": True, "bucket": data})
+        else:
+            return JSONResponse({"error": "Bucket not found"}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/buckets/{bucket_id}", methods=["PUT"])
+async def api_bucket_put(request):
+    """Update a specific bucket."""
+    from starlette.responses import JSONResponse
+    bucket_id = request.path_params["bucket_id"]
+    try:
+        body = await request.json()
+        success = await bucket_mgr.update(bucket_id, **body)
+        if not success:
+            return JSONResponse({"error": "Bucket not found"}, status_code=404)
+        if "content" in body:
+            try:
+                await embedding_engine.generate_and_store(bucket_id, str(body["content"]))
+            except Exception as e:
+                logger.warning(f"Failed to refresh embedding after bucket update: {bucket_id}: {e}")
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/buckets/{bucket_id}", methods=["DELETE"])
+async def api_bucket_delete(request):
+    """Delete a specific bucket."""
+    from starlette.responses import JSONResponse
+    bucket_id = request.path_params["bucket_id"]
+    try:
+        success = await bucket_mgr.delete(bucket_id)
+        if success:
+            try:
+                embedding_engine.delete_embedding(bucket_id)
+            except Exception as e:
+                logger.warning(f"Failed to delete embedding for bucket: {bucket_id}: {e}")
+            return JSONResponse({"ok": True})
+        else:
+            return JSONResponse({"error": "Bucket not found or could not be deleted"}, status_code=404)
+    except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 

@@ -44,6 +44,7 @@
   - 新鲜度加成：`1.0 + e^(-t/36h)`，刚存入 ×2.0，~36h 半衰，72h 后 ≈×1.0
   - 高唤醒度(arousal>0.7)且未解决 → ×1.5 紧迫度加成
   - resolved → ×0.05 沉底；resolved+digested → ×0.02 加速淡化
+- **自动软化**：dynamic 桶超过保护期（`min_age_days` 默认 14 天）后，由 LLM 压缩降维，并刷新 `last_active` 强行续命，防止流水账记忆体积无限膨胀。
 - **自动归档**：score 低于阈值(0.3) → 移入 archive
 - **自动结案**：importance≤4 且 >30天 → 自动 resolved
 - **永不衰减**：permanent / pinned / protected / feel

@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Cedarville+Cursive&family=Homemade+Apple&family=La+Belle+Aurore&display=swap');
 @import "tailwindcss";
 
 @theme {
@@ -42,18 +44,66 @@
   --color-border-hairline: #e5e3df;
 
   --font-sans: "Hanken Grotesk", sans-serif;
+  --font-serif: "Cormorant Garamond", "Songti SC", "STSong", serif;
   --font-mono: "JetBrains Mono", monospace;
 }
 
 body {
-  background-color: var(--color-background);
+  background-color: #1A1A1A; /* dark mode fallback for overscroll */
   color: var(--color-charcoal);
   font-family: var(--font-sans);
   -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+}
+@media (prefers-color-scheme: light) {
+  body {
+    background-color: #FCF5E7;
+  }
+}
+
+.marginalia-reader::highlight(marginalia-notes) {
+  color: inherit;
+  background-color: var(--reader-highlight);
+}
+
+@media (max-height: 760px) {
+  .light-traces-layout {
+    padding-top: max(0.55rem, env(safe-area-inset-top));
+    padding-bottom: max(0.45rem, env(safe-area-inset-bottom));
+  }
+
+  .light-traces-header {
+    min-height: 3.45rem;
+  }
+
+  .light-traces-main {
+    gap: 0.45rem;
+    padding-top: 1.6rem;
+  }
+
+  .light-traces-calendar {
+    padding-top: 0.55rem;
+    padding-bottom: 0.45rem;
+  }
+
+  .light-traces-calendar-day {
+    width: 1.62rem;
+    height: 1.62rem;
+  }
+
+  .light-traces-note {
+    padding-top: 0.6rem;
+    padding-bottom: 0.6rem;
+  }
+
+  .light-traces-footer {
+    height: 4.8rem;
+  }
 }
 
 /* Hide scrollbar for a cleaner instrument look */
 ::-webkit-scrollbar {
   width: 0px;
+  height: 0px;
   background: transparent;
 }

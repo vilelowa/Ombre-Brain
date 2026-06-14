@@ -141,7 +141,7 @@ class EmbeddingEngine:
                 return None
         return None
 
-    async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
+    async def search_similar(self, query: str, top_k: int = 10, allowed_ids: set[str] | list[str] = None) -> list[tuple[str, float]]:
         """
         Search for buckets similar to query text.
         Returns list of (bucket_id, similarity_score) sorted by score desc.
@@ -166,15 +166,52 @@ class EmbeddingEngine:
         if not rows:
             return []
 
-        # Calculate cosine similarity
-        results = []
+        # Parse allowed_ids into a set
+        allowed_set = None
+        if allowed_ids is not None:
+            allowed_set = set(allowed_ids)
+            
+        bucket_ids = []
+        vectors = []
+        
         for bucket_id, emb_json in rows:
+            if allowed_set is not None and bucket_id not in allowed_set:
+                continue
             try:
-                stored_embedding = json.loads(emb_json)
-                sim = self._cosine_similarity(query_embedding, stored_embedding)
-                results.append((bucket_id, sim))
+                emb_list = json.loads(emb_json)
+                bucket_ids.append(bucket_id)
+                vectors.append(emb_list)
             except (json.JSONDecodeError, Exception):
                 continue
+
+        if not bucket_ids:
+            return []
+            
+        try:
+            import numpy as np
+            q_vec = np.array(query_embedding, dtype=np.float32)
+            mat = np.array(vectors, dtype=np.float32)
+            
+            # Vectorized cosine similarity
+            # dot product
+            dot = np.dot(mat, q_vec)
+            # norms
+            norm_q = np.linalg.norm(q_vec)
+            norm_mat = np.linalg.norm(mat, axis=1)
+            
+            # Avoid division by zero
+            denom = norm_mat * norm_q
+            # compute similarities (handle denom == 0 gracefully)
+            sims = np.divide(dot, denom, out=np.zeros_like(dot), where=denom != 0)
+            
+            # Combine and sort
+            results = [(bucket_ids[i], float(sims[i])) for i in range(len(bucket_ids))]
+        except ImportError:
+            # Fallback to python calculation if numpy is missing
+            results = []
+            for i, vec in enumerate(vectors):
+                sim = self._cosine_similarity(query_embedding, vec)
+                results.append((bucket_ids[i], sim))
 
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]

@@ -38,7 +38,7 @@ class DecayEngine:
     计算衰减得分，将低活跃桶自动归档，模拟自然遗忘。
     """
 
-    def __init__(self, config: dict, bucket_mgr):
+    def __init__(self, config: dict, bucket_mgr, dehydrator=None):
         # --- Load decay parameters / 加载衰减参数 ---
         decay_cfg = config.get("decay", {})
         self.decay_lambda = decay_cfg.get("lambda", 0.05)
@@ -51,7 +51,14 @@ class DecayEngine:
         self.emotion_base = emotion_cfg.get("base", 1.0)
         self.arousal_boost = emotion_cfg.get("arousal_boost", 0.8)
 
+        # --- Softening params ---
+        soften_cfg = config.get("soften", {})
+        self.auto_soften_enabled = soften_cfg.get("enabled", True)
+        self.soften_min_age_days = soften_cfg.get("min_age_days", 14)
+        self.soften_limit = soften_cfg.get("limit", 5)
+
         self.bucket_mgr = bucket_mgr
+        self.dehydrator = dehydrator
 
         # --- Background task control / 后台任务控制 ---
         self._task: asyncio.Task | None = None
@@ -176,9 +183,9 @@ class DecayEngine:
         resolved = metadata.get("resolved", False)
         digested = metadata.get("digested", False)  # set when feel is written for this memory
         if resolved and digested:
-            resolved_factor = 0.02
+            resolved_factor = 0.15
         elif resolved:
-            resolved_factor = 0.05
+            resolved_factor = 0.3
         else:
             resolved_factor = 1.0
         urgency_boost = 1.5 if (arousal > 0.7 and not resolved) else 1.0
@@ -282,6 +289,86 @@ class DecayEngine:
         return result
 
     # ---------------------------------------------------------
+    # Execute one soften cycle
+    # 执行一轮软化周期
+    # Scan aging dynamic buckets, call dehydrator to soften them
+    # ---------------------------------------------------------
+    async def run_soften_cycle(self) -> dict:
+        """
+        Execute one soften cycle: compress aging dynamic memories
+        to save tokens and simulate human memory blurring.
+        """
+        if not self.auto_soften_enabled or not self.dehydrator:
+            return {"status": "disabled_or_missing_dehydrator"}
+
+        try:
+            buckets = await self.bucket_mgr.list_all(include_archive=False)
+        except Exception as e:
+            logger.error(f"Failed to list buckets for softening: {e}")
+            return {"error": str(e)}
+
+        from utils import now_iso
+
+        candidates = []
+        for bucket in buckets:
+            meta = bucket.get("metadata", {})
+            
+            if meta.get("type") != "dynamic":
+                continue
+            if meta.get("pinned") or meta.get("protected"):
+                continue
+            if meta.get("soften_count", 0) > 0:
+                continue  # Only soften once for now to prevent over-compression
+                
+            # P1-10: Exempt reading comments and book quotes from softening
+            if "book_id" in meta:
+                continue
+            domain_list = meta.get("domain", [])
+            if any(d in domain_list for d in ["閱讀", "reading"]):
+                continue
+
+            created_str = meta.get("created", "")
+            try:
+                created = datetime.fromisoformat(str(created_str))
+                days_since_created = (datetime.now() - created).total_seconds() / 86400
+            except (ValueError, TypeError):
+                days_since_created = 0
+
+            if days_since_created >= self.soften_min_age_days:
+                try:
+                    score = self.calculate_score(meta)
+                    # We prefer softening items that are closer to the threshold
+                    candidates.append((score, bucket))
+                except Exception:
+                    pass
+
+        # Sort by score ascending (closest to archive threshold first)
+        candidates.sort(key=lambda x: x[0])
+        
+        softened_count = 0
+        for score, bucket in candidates[:self.soften_limit]:
+            content = bucket.get("content", "")
+            meta = bucket.get("metadata", {})
+            
+            logger.info(f"Softening bucket: {meta.get('name', bucket['id'])} (age={days_since_created:.1f}d, score={score:.4f})")
+            try:
+                softened_content = await self.dehydrator.soften(content)
+                if softened_content and softened_content != content:
+                    # Update bucket with softened content, bump last_active to grant life extension
+                    await self.bucket_mgr.update(
+                        bucket["id"], 
+                        content=softened_content,
+                        soften_count=meta.get("soften_count", 0) + 1,
+                        last_softened=now_iso(),
+                    )
+                    softened_count += 1
+            except Exception as e:
+                logger.error(f"Failed to soften bucket {bucket['id']}: {e}")
+
+        logger.info(f"Soften cycle complete: softened {softened_count} buckets.")
+        return {"softened": softened_count}
+
+    # ---------------------------------------------------------
     # Background decay task management
     # 后台衰减任务管理
     # ---------------------------------------------------------
@@ -318,13 +405,19 @@ class DecayEngine:
         logger.info("Decay engine stopped / 衰减引擎已停止")
 
     async def _background_loop(self) -> None:
-        """Background loop: run decay → sleep → repeat.
-        后台循环体：执行衰减 → 睡眠 → 重复。"""
+        """Background loop: run decay → run soften → sleep → repeat.
+        后台循环体：执行衰减 → 执行软化 → 睡眠 → 重复。"""
         while self._running:
             try:
                 await self.run_decay_cycle()
             except Exception as e:
                 logger.error(f"Decay cycle error / 衰减周期出错: {e}")
+            
+            try:
+                await self.run_soften_cycle()
+            except Exception as e:
+                logger.error(f"Soften cycle error / 软化周期出错: {e}")
+                
             # --- Wait for next cycle / 等待下一个周期 ---
             try:
                 await asyncio.sleep(self.check_interval * 3600)

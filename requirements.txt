@@ -32,3 +32,10 @@ pywebpush>=2.3.0
 # 向量相似度计算 (导入模式/聚类)
 numpy>=1.24.0
 scikit-learn>=1.2.0
+
+# Anthropic SDK（Claude 原生 API，支持 cache_control 断点）
+anthropic>=0.52.0
+
+# PDF parsing
+pypdf>=4.0.0
+

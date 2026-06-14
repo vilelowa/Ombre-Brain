@@ -29,6 +29,7 @@ import os
 import math
 import logging
 import shutil
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -36,9 +37,18 @@ from typing import Optional
 import frontmatter
 from rapidfuzz import fuzz
 
+from safe_io import safe_write, safe_read
 from utils import generate_bucket_id, sanitize_name, safe_path, now_iso
 
 logger = logging.getLogger("ombre_brain.bucket")
+
+STRATA_EXCLUDED_SOURCES = {
+    "dream_reflection",
+    "dream_feedback",
+    "private_diary",
+    "daily_journal",
+    "reading_comment",
+}
 
 
 class BucketManager:
@@ -89,10 +99,62 @@ class BucketManager:
         self.w_emotion = scoring.get("emotion_resonance", 2.0)
         self.w_time = scoring.get("time_proximity", 1.5)
         self.w_importance = scoring.get("importance", 1.0)
-        self.content_weight = scoring.get("content_weight", 1.0)  # body×1, per spec
+        self.content_weight = scoring.get("content_weight", 2.5)  # body×2.5 to support conversational query
 
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
+
+    def infer_source(self, metadata: dict, file_path: str = "") -> str:
+        """Return the owning feature/source for old buckets without source metadata."""
+        explicit = str(metadata.get("source", "")).strip().lower()
+        if explicit:
+            return explicit
+
+        normalized_path = os.path.normpath(file_path).lower() if file_path else ""
+        domains = {str(value).strip().lower() for value in metadata.get("domain", [])}
+        bucket_type = str(metadata.get("type", "")).strip().lower()
+
+        if metadata.get("reflection_type") == "dream" or f"{os.sep}feel{os.sep}dream{os.sep}" in normalized_path:
+            return "dream_reflection"
+        if metadata.get("private") or f"{os.sep}feel{os.sep}private{os.sep}" in normalized_path:
+            return "private_diary"
+        if metadata.get("book_id") or {"阅读", "reading"} & domains:
+            return "reading_comment"
+        if {"日記", "journal"} & domains:
+            return "daily_journal"
+        if "dream_feedback" in domains:
+            return "dream_feedback"
+        if "chat-message" in domains:
+            return "chat_message"
+        if bucket_type == "core" or (file_path and self._is_core_path(file_path)):
+            return "core_manual"
+        if bucket_type == "feel":
+            return "feel"
+        if metadata.get("imported") or "import" in domains or "imported" in domains:
+            return "import"
+        return "hold"
+
+    def migrate_missing_sources(self) -> int:
+        """Persist inferred source metadata for existing Markdown buckets."""
+        migrated = 0
+        for dir_path in [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir]:
+            if not os.path.exists(dir_path):
+                continue
+            for root, _, files in os.walk(dir_path):
+                for filename in files:
+                    if not filename.endswith(".md"):
+                        continue
+                    file_path = os.path.join(root, filename)
+                    try:
+                        post = frontmatter.load(file_path)
+                        if str(post.get("source", "")).strip():
+                            continue
+                        post["source"] = self.infer_source(dict(post.metadata), file_path)
+                        safe_write(file_path, frontmatter.dumps(post))
+                        migrated += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to migrate bucket source: {file_path}: {e}")
+        return migrated
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -112,6 +174,8 @@ class BucketManager:
         name: str = None,
         pinned: bool = False,
         protected: bool = False,
+        source: str = "",
+        **kwargs
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -150,10 +214,14 @@ class BucketManager:
             "last_active": now_iso(),
             "activation_count": 0,
         }
+        if source:
+            metadata["source"] = str(source)
         if pinned:
             metadata["pinned"] = True
         if protected:
             metadata["protected"] = True
+            
+        metadata.update(kwargs)
 
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 组装 Markdown 文件 ---
@@ -185,8 +253,7 @@ class BucketManager:
         file_path = safe_path(target_dir, filename)
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            safe_write(file_path, frontmatter.dumps(post))
         except OSError as e:
             logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
             raise
@@ -195,6 +262,11 @@ class BucketManager:
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
             + (" [PINNED]" if pinned else "") + (" [PROTECTED]" if protected else "")
         )
+        
+        # --- P1-2: Auto-generate embedding for new bucket ---
+        if self.embedding_engine and self.embedding_engine.enabled:
+            asyncio.create_task(self.embedding_engine.generate_and_store(bucket_id, linked_content))
+            
         return bucket_id
 
     async def create_dream_reflection(
@@ -202,6 +274,8 @@ class BucketManager:
         content: str,
         influence_type: str,
         source_bucket_ids: list[str] = None,
+        related_past_dream_ids: list[str] = None,
+        related_feel_ids: list[str] = None,
         valence: float = 0.5,
         arousal: float = 0.3,
         name: str = None,
@@ -225,9 +299,12 @@ class BucketManager:
             "arousal": max(0.0, min(1.0, arousal)),
             "importance": 5,
             "type": "feel",
+            "source": "dream_reflection",
             "reflection_type": "dream",
             "influence_type": influence_type,
             "source_bucket_ids": source_bucket_ids or [],
+            "related_past_dream_ids": related_past_dream_ids or [],
+            "related_feel_ids": related_feel_ids or [],
             "created": now_iso(),
             "last_active": now_iso(),
             "activation_count": 0,
@@ -243,14 +320,18 @@ class BucketManager:
         file_path = safe_path(target_dir, filename)
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            safe_write(file_path, frontmatter.dumps(post))
         except OSError as e:
             logger.error(f"Failed to write dream reflection / 写入梦反思失败: {file_path}: {e}")
             raise
 
         await self.prune_dream_reflections(influence_type)
         logger.info(f"Created dream reflection / 创建梦反思: {bucket_id} ({influence_type})")
+        
+        # --- P1-2: Auto-generate embedding for new reflection ---
+        if self.embedding_engine and self.embedding_engine.enabled:
+            asyncio.create_task(self.embedding_engine.generate_and_store(bucket_id, content))
+            
         return bucket_id
 
     async def prune_dream_reflections(self, influence_type: str = None) -> int:
@@ -327,6 +408,7 @@ class BucketManager:
             "arousal": max(0.0, min(1.0, arousal)),
             "importance": 5,
             "type": "feel",
+            "source": "private_diary",
             "private": True,
             "created": now_iso(),
             "last_active": now_iso(),
@@ -345,8 +427,7 @@ class BucketManager:
         file_path = safe_path(self.private_dir, filename)
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            safe_write(file_path, frontmatter.dumps(post))
         except OSError as e:
             logger.error(f"Failed to write private entry / 写入私密日记失败: {file_path}: {e}")
             raise
@@ -435,7 +516,7 @@ class BucketManager:
     # Update bucket
     # 更新桶
     # Supports: content, tags, importance, valence, arousal, name, resolved,
-    # dream_candidate
+    # dream_candidate, and feature-specific metadata.
     # ---------------------------------------------------------
     async def update(self, bucket_id: str, **kwargs) -> bool:
         """
@@ -451,6 +532,9 @@ class BucketManager:
         except Exception as e:
             logger.warning(f"Failed to load bucket for update / 加载桶失败: {file_path}: {e}")
             return False
+        existing_sources = post.get("sources", [])
+        if not isinstance(existing_sources, list):
+            existing_sources = [existing_sources] if existing_sources else []
 
         # --- Pinned/protected buckets: lock importance to 10, ignore importance changes ---
         # --- 钉选/保护桶：importance 不可修改，强制保持 10 ---
@@ -485,13 +569,51 @@ class BucketManager:
             post["dream_candidate"] = bool(kwargs["dream_candidate"])
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
+        if "comments" in kwargs:
+            post["comments"] = kwargs["comments"]
+        if "book_id" in kwargs:
+            post["book_id"] = str(kwargs["book_id"])
+        if "book_name" in kwargs:
+            post["book_name"] = str(kwargs["book_name"])
+        if "chapter" in kwargs:
+            post["chapter"] = str(kwargs["chapter"])
+        if "chapter_idx" in kwargs:
+            post["chapter_idx"] = (
+                int(kwargs["chapter_idx"]) if kwargs["chapter_idx"] is not None else None
+            )
+        if "character_offset" in kwargs:
+            post["character_offset"] = (
+                int(kwargs["character_offset"])
+                if kwargs["character_offset"] is not None
+                else None
+            )
+        if "original" in kwargs:
+            post["original"] = str(kwargs["original"])
+        if "comment" in kwargs:
+            post["comment"] = str(kwargs["comment"])
+        if "flag" in kwargs:
+            post["flag"] = str(kwargs["flag"])
+        if "category" in kwargs:
+            post["category"] = str(kwargs["category"])
+        if "source" in kwargs:
+            new_source = str(kwargs["source"]).strip()
+            old_source = str(post.get("source", "")).strip()
+            post["source"] = old_source or new_source
+            post["sources"] = list(dict.fromkeys(
+                source for source in [*existing_sources, old_source, new_source] if source
+            ))
+        if "last_softened" in kwargs:
+            post["last_softened"] = kwargs["last_softened"]
+        if "soften_count" in kwargs:
+            post["soften_count"] = int(kwargs["soften_count"])
+        if "recurrence_count" in kwargs:
+            post["recurrence_count"] = int(kwargs["recurrence_count"])
 
-        # --- Auto-refresh activation time / 自动刷新激活时间 ---
+                # --- Auto-refresh activation time / 自动刷新激活时间 ---
         post["last_active"] = now_iso()
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            safe_write(file_path, frontmatter.dumps(post))
         except OSError as e:
             logger.error(f"Failed to write bucket update / 写入桶更新失败: {file_path}: {e}")
             return False
@@ -504,9 +626,34 @@ class BucketManager:
         domain = post.get("domain", ["未分类"])
         if kwargs.get("pinned") and post.get("type") != "permanent":
             post["type"] = "permanent"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-            self._move_bucket(file_path, self.permanent_dir, domain)
+            safe_write(file_path, frontmatter.dumps(post))
+            file_path = self._move_bucket(file_path, self.permanent_dir, domain)
+
+        # --- P1-6: Sync File Rename/Move on Name or Domain Change ---
+        # 如果 name 或 domain 被修改，同步更新物理文件位置
+        bucket_type = post.get("type", "dynamic")
+        if bucket_type == "permanent":
+            type_dir = self.permanent_dir
+        elif bucket_type == "feel":
+            type_dir = self.feel_dir
+        elif bucket_type == "archived":
+            type_dir = self.archive_dir
+        else:
+            type_dir = self.dynamic_dir
+            
+        file_path = self._move_bucket(file_path, type_dir, domain)
+        
+        expected_filename = f"{post.get('name', bucket_id)}_{bucket_id}.md" if post.get("name") else f"{bucket_id}.md"
+        old_filename = os.path.basename(file_path)
+        if old_filename != expected_filename:
+            new_path = safe_path(os.path.dirname(file_path), expected_filename)
+            if os.path.normpath(file_path) != os.path.normpath(new_path):
+                os.rename(file_path, new_path)
+                logger.info(f"Renamed bucket file: {old_filename} → {expected_filename}")
+
+        # --- P1-2: Auto-update embedding if content changed ---
+        if "content" in kwargs and self.embedding_engine and self.embedding_engine.enabled:
+            asyncio.create_task(self.embedding_engine.generate_and_store(bucket_id, post.content))
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
@@ -566,8 +713,7 @@ class BucketManager:
             post["last_active"] = now_iso()
             post["activation_count"] = post.get("activation_count", 0) + 1
 
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            safe_write(file_path, frontmatter.dumps(post))
 
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
@@ -616,8 +762,7 @@ class BucketManager:
                     current_count = post.get("activation_count", 1)
                     # Store as float for fractional increments; calculate_score handles it
                     post["activation_count"] = round(current_count + 0.3, 1)
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(frontmatter.dumps(post))
+                    safe_write(file_path, frontmatter.dumps(post))
                     rippled += 1
                 except Exception:
                     continue
@@ -771,7 +916,7 @@ class BucketManager:
             )
             * 2
         )
-        content_score = fuzz.partial_ratio(query, bucket.get("content", "")[:1000]) * self.content_weight
+        content_score = fuzz.partial_ratio(query, bucket.get("content", "")[:3000]) * self.content_weight
 
         return (name_score + domain_score + tag_score + content_score) / (100 * (3 + 2.5 + 2 + self.content_weight))
 
@@ -868,10 +1013,18 @@ class BucketManager:
             for filename in files:
                 if not filename.endswith(".md"):
                     continue
+                if filename == "base_persona.md":
+                    continue
                 file_path = os.path.join(root, filename)
                 entry = self._load_bucket(file_path)
-                if entry:
-                    entries.append(entry)
+                if not entry:
+                    continue
+                metadata = entry.get("metadata", {})
+                if str(metadata.get("type", "")).strip().lower() != "core":
+                    continue
+                if not str(metadata.get("id", entry.get("id", ""))).strip():
+                    continue
+                entries.append(entry)
 
         entries.sort(
             key=lambda e: (
@@ -1047,8 +1200,7 @@ class BucketManager:
 
             # Update type marker then move file / 更新类型标记后移动文件
             post["type"] = "archived"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            safe_write(file_path, frontmatter.dumps(post))
 
             # Use shutil.move for cross-filesystem safety
             # 使用 shutil.move 保证跨文件系统安全
@@ -1108,9 +1260,12 @@ class BucketManager:
         """
         try:
             post = frontmatter.load(file_path)
+            metadata = dict(post.metadata)
+            if not str(metadata.get("source", "")).strip():
+                metadata["source"] = self.infer_source(metadata, file_path)
             return {
                 "id": post.get("id", Path(file_path).stem),
-                "metadata": dict(post.metadata),
+                "metadata": metadata,
                 "content": post.content,
                 "path": file_path,
             }

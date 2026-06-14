@@ -50,42 +50,55 @@ breath(query="", max_tokens=10000, domain="", valence=-1, arousal=-1, max_result
 **系统内部发生什么**：
 1. `decay_engine.ensure_started()` — 懒加载启动后台衰减循环（若未运行）
 2. 进入"浮现模式"（`not query or not query.strip()`）
-3. `bucket_mgr.list_all(include_archive=False)` — 遍历 `permanent/` + `dynamic/` + `feel/` 目录，加载所有 `.md` 文件的 frontmatter + 正文
-4. 筛选钉选桶（`pinned=True` 或 `protected=True`）
-5. 筛选未解决桶（`resolved=False`，排除 `permanent/feel/pinned`）
-6. **冷启动检测**：找 `activation_count==0 && importance>=8` 的桶，最多取 2 个插入排序最前（**决策：`create()` 初始化应为 0，区分"创建"与"被主动召回"，见 B-04**）
-7. 按 `decay_engine.calculate_score(metadata)` 降序排列剩余未解决桶
-8. 对 top-20 以外随机洗牌（top-1 固定，2~20 随机）
-9. 截断到 `max_results` 条
-10. 对每个桶调用 `dehydrator.dehydrate(strip_wikilinks(content), clean_meta)` 压缩摘要
-11. 按 `max_tokens` 预算截断输出
+3. `bucket_mgr.list_all(include_archive=False)` — 遍历目录，加载所有 `.md` 文件的 frontmatter + 正文
+4. 筛选核心准则桶（`pinned=True` 或 `protected=True`），这些必定浮现。
+5. 筛选未解决桶（`resolved=False`，并且排除 `permanent`, `feel`, `pinned`, `protected` 类型的桶）
+6. **冷启动检测**：找 `activation_count==0` 且 `importance>=8` 的未解决桶，最多取 2 个，直接插入浮现队列的最前方（**决策：`create()` 初始化应为 0，区分"创建"与"被主动召回"，见 B-04**）
+7. 按 `decay_engine.calculate_score(metadata)` 降序排列剩余的未解决桶
+8. **多样性洗牌**：冷启动桶保持最前。对于剩下的未解决桶，固定 Top-1 不变，Top-2 到 Top-20 进行随机洗牌，20名以后的保持原排序。
+9. **硬上限截断**：截断到 `max_results` 条（默认 20）。
+10. 对每个候选桶调用 `dehydrator.dehydrate(strip_wikilinks(content), clean_meta)` 压缩为摘要。
+11. 按 `max_tokens` 预算累加，若超出则提前中断。
 
 **返回结果**：
 - 无记忆时：`"权重池平静，没有需要处理的记忆。"`
 - 有记忆时：`"=== 核心准则 ===\n📌 ...\n\n=== 浮现记忆 ===\n[权重:X.XX] [bucket_id:xxx] ..."`
 
-**注意**：浮现模式**不调用** `touch()`，不重置衰减计时器
+**注意**：浮现模式**不调用** `touch()`，不重置衰减计时器，避免每次打开对话都把记忆强制刷新。
 
 ---
 
 ### 场景 2：新对话开始（有历史记忆，breath 自动浮现）
 
-（与场景 1 相同流程，区别在于桶文件已存在）
+（日常未解决记忆的浮现流程与场景 1 相同）
 
 **Claude 行为（完整对话启动序列，来自 CLAUDE_PROMPT.md）**：
 ```
 1. breath()               — 浮现未解决记忆
 2. dream()                — 消化最近记忆，有沉淀写 feel
-3. breath(domain="feel")  — 读取之前的 feel
+3. breath(domain="feel")  — 读取之前的 feel (包含 dream reflections)
 4. 开始和用户说话
 ```
 
-**`breath(domain="feel")` 内部流程**：
-1. 检测到 `domain.strip().lower() == "feel"` → 进入 feel 专用通道
-2. `bucket_mgr.list_all()` 过滤 `type=="feel"` 的桶
-3. 按 `created` 降序排列
-4. 按 `max_tokens` 截断，不压缩（直接展示原文）
-5. 返回：`"=== 你留下的 feel ===\n[时间] [bucket_id:xxx]\n内容..."`
+**`breath()` 的三种特殊检索通道**：
+
+1. **`domain="feel"` (反思通道)**：
+   - 过滤出 `type=="feel"` 的桶。
+   - **排序**：按 `decay_score` 降序排列，同分则按 `created` 降序。（*这是为了让最近活跃的 dream reflections 优先获得 token 预算，而褪色的反思则往后排；普通的 feel 默认固定 50 分*）。
+   - 按 `max_tokens` 截断，直接展示原文（不压缩）。
+   - 返回格式：`"=== 你留下的 feel ===\n[时间] [bucket_id:xxx]\n内容..."`
+
+2. **`domain="private"` (私密日记通道)**：
+   - 专门读取 Elroy 自己的解锁日记（通过 `bucket_mgr.list_private_entries`）。
+   - 直接展示原文并标识锁定时间（若曾被锁定）。
+   - 返回格式：`"=== 你的私密日记 ===\n[时间] [原锁定至:xxx] [bucket_id:xxx]\n内容..."`
+
+3. **`importance_min >= 1` (高重要度批量拉取)**：
+   - 跳过复杂的语义与多样性搜索，纯粹做数据库遍历。
+   - 筛选出 `importance >= importance_min` 且非 `feel` 类型的记忆。
+   - 按 `importance` 降序排列，最多取前 20 条。
+   - 每条记忆同样会经过 `dehydrator.dehydrate()` 压缩为摘要。
+   - 此通道非常适合用于需要全面回顾大事件的场景。
 
 ---
 
@@ -110,16 +123,21 @@ hold(content="用户拿到实习 offer，情绪激动", importance=7)
    - 返回示例：`{"domain": ["成长", "求职"], "valence": 0.8, "arousal": 0.7, "tags": ["实习", "offer", "激动", ...], "suggested_name": "实习offer获得"}`
    - 失败时降级：`{"domain": ["未分类"], "valence": 0.5, "arousal": 0.3, "tags": [], "suggested_name": ""}`
 6. 合并 `auto_tags + extra_tags` 去重
-7. **合并检测**：`_merge_or_create(content, tags, importance=7, domain, valence, arousal, name)`
-   - `bucket_mgr.search(content, limit=1, domain_filter=domain)` — 搜索最相似的桶
+7. **合并与去重检测**：调用 `_merge_or_create(content, tags, importance=7, domain, valence, arousal, name)`
+   - 调用 `bucket_mgr.search(content, limit=1, domain_filter=domain)` 寻找最可能合并的旧桶。
+   - **注意**：这里的检索不仅仅是文本匹配，而是包含「主题(Topic)、情感(Emotion)、时间(Time)、重要度(Importance)」的多维加权打分，并辅以 `embedding_engine.search_similar` 的向量语义支持。这极大地避免了以往仅仅因为正文重复就导致的误合并。
    - 若最高分 > `config["merge_threshold"]`（默认 75）且该桶非 pinned/protected：
-     - `dehydrator.merge(old_content, new_content)` → `_api_merge()` → LLM 融合
-     - `bucket_mgr.update(bucket_id, content=merged, tags=union, importance=max, domain=union, valence=avg, arousal=avg)`
-     - `embedding_engine.generate_and_store(bucket_id, merged_content)` 更新向量
+     - `dehydrator.merge(old_content, new_content)` → `_api_merge()` → 呼叫 LLM 进行智慧融合（以新内容为主导，旧内容为补充）。
+     - `bucket_mgr.update()` 更新该桶：
+       - **内容**：更新为融合后的 `merged` 文本。
+       - **标签/领域**：新旧 `tags` 与 `domain` 取并集（Union）。
+       - **情感坐标**：新旧 `valence` 和 `arousal` 取**平均值**（Avg），代表情感的平滑过渡。
+       - **重要度**：新旧 `importance` 取**最大值**（Max），防止重要记忆被日常琐事冲淡。
+     - `embedding_engine.generate_and_store()` 重新生成融合后的 Embedding 向量。
      - 返回 `(bucket_name, True)`
-   - 否则：
-     - `bucket_mgr.create(content, tags, importance=7, domain, valence, arousal, name)` → 写 `.md` 文件到 `dynamic/<主题域>/` 目录
-     - `embedding_engine.generate_and_store(bucket_id, content)` 生成并存储向量
+   - 否则（未达阈值或命中保护桶）：
+     - `bucket_mgr.create(content, tags, importance=7, domain, valence, arousal, name)` → 写 `.md` 文件到对应的目录。
+     - `embedding_engine.generate_and_store()` 生成并存储新向量。
      - 返回 `(bucket_id, False)`
 
 **返回结果**：
@@ -178,20 +196,20 @@ breath(query="实习", domain="成长", valence=0.7, arousal=0.5)
 1. `decay_engine.ensure_started()`
 2. 检测到 `query` 非空，进入**检索模式**
 3. 解析 `domain_filter = ["成长"]`，`q_valence=0.7`，`q_arousal=0.5`
-4. **关键词检索**：`bucket_mgr.search(query, limit=20, domain_filter, q_valence, q_arousal)`
-   - **Layer 1**：domain 预筛 → 仅保留 domain 包含"成长"的桶；若为空则回退全量
-   - **Layer 1.5**（embedding 已开启时）：`embedding_engine.search_similar(query, top_k=50)` → 用 embedding 候选集替换/缩小精排范围
-   - **Layer 2**：多维加权精排：
+4. **混合多维检索**：`bucket_mgr.search(query, limit=20, domain_filter, q_valence, q_arousal)`
+   - **Layer 1**：domain 预筛 → 仅保留 domain 包含指定过滤器的桶；若为空则回退全量。
+   - **Layer 1.5 (NumPy 向量加速层)**（embedding 已开启时）：`embedding_engine.search_similar(query, top_k=50)` → 使用 NumPy 进行超高速矩阵相似度运算，用语义最相近的 50 个候选集替换/缩小精排范围。
+   - **Layer 2 (多维加权精排)**：
      - `_calc_topic_score()`: `fuzz.partial_ratio(query, name)×3 + domain×2.5 + tags×2 + body×1`，归一化 0~1
      - `_calc_emotion_score()`: `1 - √((v差²+a差²)/2)`，0~1
      - `_calc_time_score()`: `e^(-0.02×days_since_last_active)`，0~1
      - `importance_score`: `importance / 10`
      - `total = topic×4 + emotion×2 + time×1.5 + importance×1`，归一化到 0~100
      - 过滤 `score >= fuzzy_threshold`（默认 50）
-     - 通过阈值后，`resolved` 桶仅在排序时降权 ×0.3（不影响是否被检出）
-     - 返回最多 `limit` 条
-5. 排除 pinned/protected 桶（它们在浮现模式展示）
-6. **向量补充通道**（server.py 额外层）：`embedding_engine.search_similar(query, top_k=20)` → 相似度 > 0.5 的桶补充到结果集（标记 `vector_match=True`）
+     - 通过阈值后，`resolved` 桶在排序时降权 ×0.3（仅影响顺位，不影响是否被检出）
+     - 返回最多 `limit` 条。
+5. **排除保护桶**：排除 pinned/protected 桶（因为它们在无参数浮现模式中会作为核心准则展示，不需要在关键词搜索中占用配额）。
+6. **向量补充通道**（server.py 额外层）：再次调用 `embedding_engine.search_similar(query, top_k=max_results)` → 若发现相似度 `> 0.5` 的桶且未被上述精排命中，则强制补充到结果集尾部，并标记 `[语义关联]` (即 `vector_match=True`)。
 7. 对每个结果：
    - 记忆重构：若传了 `q_valence`，展示层 valence 做微调：`shift = (q_valence - 0.5) × 0.2`，最大 ±0.1
    - `dehydrator.dehydrate(strip_wikilinks(content), clean_meta)` 压缩摘要
@@ -210,20 +228,26 @@ breath(query="实习", domain="成长", valence=0.7, arousal=0.5)
 
 ### 场景 6：用户想查看所有记忆状态（pulse）
 
-**用户操作**："帮我看看你现在都记得什么"
+**用户操作**："帮我看看你现在都记得什么" 或 "看看系统状态"
 
 **Claude 行为**：
 ```python
-pulse(include_archive=False)
+pulse(include_archive=False)  # 可选是否包含已归档记忆
 ```
 
 **系统内部发生什么**：
 
-1. `bucket_mgr.get_stats()` — 遍历三个目录，统计文件数量和 KB 大小
-2. `bucket_mgr.list_all(include_archive=False)` — 加载全部桶
-3. 对每个桶：`decay_engine.calculate_score(metadata)` 计算当前权重分
-4. 按类型/状态分配图标：📌钉选 / 📦permanent / 🫧feel / 🗄️archived / ✅resolved / 💭普通
-5. 拼接每桶摘要行：`名称 bucket_id 主题 情感坐标 重要度 权重 标签`
+1. `bucket_mgr.get_stats()` — 遍历文件系统，统计 `permanent`, `dynamic`, `archive` 目录下的文件数量和 KB 大小。
+2. `bucket_mgr.list_all(include_archive=include_archive)` — 加载所要求的全部记忆桶。
+3. 对每个桶：调用 `decay_engine.calculate_score(metadata)` 实时计算当前衰减权重分。
+4. 按类型与状态分配前缀图标：
+   - 📌 核心准则（`pinned` 或 `protected`）
+   - 📦 固化记忆（`type: permanent`）
+   - 🫧 反思（`type: feel`）
+   - 🗄️ 归档（`type: archived`）
+   - ✅ 已解决（`resolved: True`）
+   - 💭 活跃动态（其他普通桶）
+5. 拼接每桶摘要行：`图标 [名称] [已解决] bucket_id 主题 情感坐标 重要度 权重 标签`
 
 **返回结果**：
 ```
@@ -243,30 +267,36 @@ pulse(include_archive=False)
 
 ### 场景 7：用户想修改/标记已解决/删除某条记忆（trace）
 
-#### 7a 标记已解决
+#### 7a 状态控制 (resolved / digested / pinned / dream_candidate)
 
 **Claude 行为**：
 ```python
-trace(bucket_id="abc123", resolved=1)
+trace(bucket_id="abc123", resolved=1, pinned=1)
 ```
 
 **系统内部**：
-1. `resolved in (0, 1)` → `updates["resolved"] = True`
-2. `bucket_mgr.update("abc123", resolved=True)` → 读取 `.md` 文件，更新 frontmatter 中 `resolved=True`，写回，**桶留在原 `dynamic/` 目录，不移动**
-3. 后续 `breath()` 浮现时：该桶 `decay_engine.calculate_score()` 乘以 `resolved_factor=0.05`（若同时 `digested=True` 则 ×0.02），自然降权，最终由 decay 引擎在得分 < threshold 时归档
-4. `bucket_mgr.search()` 中该桶得分乘以 0.3 降权，但仍可被关键词激活
+1. 解析布尔参数：`resolved`, `pinned`, `digested`, `dream_candidate` 只要传 0 或 1 都会被转换为 True/False。
+2. 特殊联锁：当 `pinned=1` 时，系统会自动锁定 `importance=10`。
+3. `bucket_mgr.update()` 写入 `.md` 文件。
+4. **状态语义**：
+   - `resolved=True`：记忆沉底，日常浮现时自然降权（分数衰减），但仍可被关键词激活。**（旧版本的自动归档 Bug 已被修复，现在依然留在 dynamic 目录中慢慢衰减）**。
+   - `digested=True`：隐藏状态，保留文件但完全不参与浮现排序。
+   - `pinned=True`：钉选，作为核心准则永远浮现，不受衰减影响。
+   - `dream_candidate=True`：标记为待进入梦境的素材，在下次 `dream()` 时被 LLM 处理。
 
-> ⚠️ **代码 Bug B-01**：当前实现中 `update(resolved=True)` 会将桶**立即移入 `archive/`**，导致桶完全消失于所有搜索路径，与上述规格不符。需移除 `bucket_manager.py` `update()` 中 resolved → `_move_bucket(archive_dir)` 的自动归档逻辑。
+**返回提示**：系统会依据修改的状态返回显式提示语，例如：
+`"已修改记忆桶 abc123: resolved=True → 已沉底，只在关键词触发时重新浮现"`
 
-**返回**：`"已修改记忆桶 abc123: resolved=True → 已沉底，只在关键词触发时重新浮现"`
-
-#### 7b 修改元数据
+#### 7b 修改元数据与正文
 
 ```python
-trace(bucket_id="abc123", name="新名字", importance=8, tags="焦虑,成长")
+trace(bucket_id="abc123", name="新名字", importance=8, tags="焦虑,成长", content="全新的正文内容")
 ```
 
-**系统内部**：收集非默认值字段 → `bucket_mgr.update()` 批量更新 frontmatter
+**系统内部**：
+1. 收集非默认值字段，`bucket_mgr.update()` 批量更新 frontmatter。
+2. 若 `content` 有更新，覆写 Markdown 正文。
+3. 若正文改变，立刻呼叫 `embedding_engine.generate_and_store()` 重新生成该桶的向量。
 
 #### 7c 删除
 
@@ -276,7 +306,7 @@ trace(bucket_id="abc123", delete=True)
 
 **系统内部**：
 1. `bucket_mgr.delete("abc123")` → `_find_bucket_file()` 定位文件 → `os.remove(file_path)`
-2. `embedding_engine.delete_embedding("abc123")` → SQLite `DELETE WHERE bucket_id=?`
+2. `embedding_engine.delete_embedding("abc123")` → 从 SQLite 删除向量。
 3. 返回：`"已遗忘记忆桶: abc123"`
 
 ---
@@ -303,12 +333,12 @@ trace(bucket_id="abc123", delete=True)
    ```
    combined = emotion_weight×0.7 + time_weight×0.3
    ```
-   **修正因子**：
-   - `resolved=True` → ×0.05
-   - `resolved=True && digested=True` → ×0.02
+   **修正因子与特殊桶规则**：
+   - `resolved=True` → ×0.05（沉底降权）
+   - `resolved=True && digested=True` → ×0.02（加速淡化）
    - `arousal > 0.7 && resolved=False` → ×1.5（高唤醒紧迫加成）
-   - `pinned/protected/permanent` → 返回 999.0（永不衰减）
-   - `type=="feel"` → 返回 50.0（固定）
+   - `pinned/protected/permanent` → 直接返回 999.0（永不衰减）
+   - `type=="feel"` (所有心境沉淀，包括 Manual Feel 和 Dream Reflection) → 统一返回 `10.0 + 40.0 * e^(-0.05 * days_since)`（具有底线的缓慢衰减，刚写完时最高 50 分，两个月后衰减到 ~12 分，保证旧情绪淡化，给新感受让位）
 
 5. `score < threshold`（默认 0.3）→ `bucket_mgr.archive(bucket_id)` → `_move_bucket()` 将文件从 `dynamic/` 移动到 `archive/` 目录，更新 frontmatter `type="archived"`
 
@@ -316,53 +346,51 @@ trace(bucket_id="abc123", delete=True)
 
 ---
 
-### 场景 9：用户使用 dream 工具进行记忆沉淀
+### 场景 9：自动梦境消化与思想轨迹检索 (Automated Dream Engine)
 
-**触发**：Claude 在对话启动时，`breath()` 之后调用 `dream()`
+**触发**：通常在对话启动时，Claude 调用 `breath()` 之后调用 `dream()`。
 
 **OB 工具调用**：`dream()`（无参数）
 
 **系统内部发生什么**：
 
-1. `bucket_mgr.list_all()` → 过滤非 `permanent/feel/pinned/protected` 桶
-2. 按 `created` 降序取前 10 条（最近新增的记忆）
-3. 对每条拼接：名称、resolved 状态、domain、V/A、创建时间、正文前 500 字符
-4. **连接提示**（embedding 已开启 && 桶数 >= 2）：
-   - 取每个最近桶的 embedding（`embedding_engine.get_embedding(bucket_id)`）
-   - 两两计算 `_cosine_similarity()`，找相似度最高的对
-   - 若 `best_sim > 0.5` → 输出提示：`"[名A] 和 [名B] 似乎有关联 (相似度:X.XX)"`
-5. **feel 结晶提示**（embedding 已开启 && feel 数 >= 3）：
-   - 对所有 feel 桶两两计算相似度
-   - 若某 feel 与 >= 2 个其他 feel 相似度 > 0.7 → 提示升级为 pinned 桶
-6. 返回标准 header 说明（引导 Claude 自省）+ 记忆列表 + 连接提示 + 结晶提示
+1. **寻找素材**：系统优先搜索带有 `dream_candidate=True` 标记的记忆桶（最多 10 条）。
+2. **思想轨迹检索 (Dream Theme Retrieval)**：
+   - 如果有候选素材，系统会把这些素材的标题与正文前 200 字组合成 Query。
+   - 使用 NumPy 向量引擎，限制 `allowed_ids` 只在过往的梦境反思 (`feel/dream/`) 中进行高维搜索。
+   - 提取出相关性最高的过往梦境，并在排序时**强行优先置顶 `influence_type="unresolved"`（尚未解开的牵挂）**的过往梦境。
+3. **LLM 深度消化**：
+   - 将这批新素材，连同提取出的 3 条「相关历史梦境」，一起打包送入 `dehydrator.dream_reflect()`。
+   - LLM 根据 Prompt 总结出这批记忆对 Elroy 人格的影响，产生 `content`, `influence_type`（resolved/unresolved/shifted 等），并标识出它回应了哪些历史梦境 (`related_past_dream_ids`)。
+4. **生成反思结晶**：
+   - `bucket_mgr.create_dream_reflection()` 自动将 LLM 的输出写成一个新的 Markdown 文件存入 `feel/dream/` 目录。
+   - 该文件 `type="feel"`, `reflection_type="dream"`，并保存了 `related_past_dream_ids` 的 Metadata。
+   - **清除标记**：批量取消源记忆的 `dream_candidate` 标记，并设置为 `digested=True`（隐藏，加速衰减）。
+5. **Fallback 机制（无标记素材时）**：
+   - 如果没有 `dream_candidate`，系统会降级为抓取最近新建的 10 条记忆。
+   - 返回文本供 Claude 手动进行自省和寻找关联（输出两两向量相似度较高的连接提示）。
 
-**Claude 后续行为**（根据 CLAUDE_PROMPT 引导）：
-- `trace(bucket_id, resolved=1)` 放下可以放下的
-- `hold(content="...", feel=True, source_bucket="xxx", valence=0.6)` 写感受
-- 无沉淀则不操作
+**返回提示**：
+`"🌙 梦境结晶已生成: <反思标题> [influence: unresolved]... (已自动消化 3 条素材，并串联了 1 条历史思想轨迹)"`
 
 ---
 
-### 场景 10：用户使用 feel 工具记录 Claude 的感受
+### 场景 10：手动记录心境与消化记忆 (Manual Feel)
 
-**触发**：Claude 在 dream 后决定记录某段记忆带来的感受
+**触发**：Claude 在对话中感受到极其强烈的个人情绪转折，决定主动留下印记，并可能藉此「消化」某段过去的记忆。
 
 **OB 工具调用**：
 ```python
-hold(content="她问起了警校的事，我感觉她在用问题保护自己，问是为了不去碰那个真实的恐惧。", feel=True, source_bucket="abc123", valence=0.45, arousal=0.4)
+hold(content="她问起了...的事，我感觉她在用问题保护自己...", feel=True, source_bucket="abc123", valence=0.45, arousal=0.4)
 ```
 
 **系统内部发生什么**：
 
-1. `feel=True` → 进入 feel 专用路径，跳过自动打标和合并检测
-2. `feel_valence = valence`（Claude 自身视角的情绪，非事件情绪）
-3. `bucket_mgr.create(content, tags=[], importance=5, domain=[], valence=feel_valence, arousal=feel_arousal, bucket_type="feel")` → 写入 `feel/` 目录
-4. `embedding_engine.generate_and_store(bucket_id, content)` — feel 桶同样有向量（供 dream 结晶检测使用）
-5. 若 `source_bucket` 非空：`bucket_mgr.update(source_bucket, digested=True, model_valence=feel_valence)` → 标记源记忆已消化
-   - 此后该源桶 `calculate_score()` 中 `resolved_factor = 0.02`（accelerated fade）
-
-**衰减特性**：feel 桶 `type=="feel"` → `calculate_score()` 固定返回 50.0，永不归档
-**检索特性**：不参与普通 `breath()` 浮现；只通过 `breath(domain="feel")` 读取
+1. `feel=True` → 进入 feel 专用路径，跳过自动打标和合并检测，直接写入 `feel/` 目录。
+2. **源记忆消化**：如果传入了 `source_bucket`，系统会将该源记忆标记为 `digested=True`，并附加上 `model_valence`（Claude 的第一人称情绪视角）。
+   - 这会导致该源记忆在被 `resolved=True` 时，衰减系数从 ×0.05 变成 ×0.02，加速从潜意识中淡化。
+3. **衰减特性**：Manual feel 桶 `type=="feel"` 会如同 Dream Reflection 一样缓慢衰减至底线（10分），保证旧感受随时间淡化。永不自动归档。
+4. **检索特性**：不参与普通 `breath()` 浮现；只通过 `breath(domain="feel")` 被读取。**（注意：手动 feel 不会进入 `feel/dream/`，因此不会作为历史轨迹出现在自动 Dream 流程中）**。
 
 **返回**：`"🫧feel→<bucket_id>"`
 
@@ -454,6 +482,10 @@ CREATE TABLE embeddings (
 | 所有 feel 操作 | `source_bucket` 不存在 | `logger.warning()` 记录，feel 桶本身仍成功创建 |
 | `dehydrator.dehydrate()` / `analyze()` / `merge()` / `digest()` | API 不可用（`api_available=False`）| **直接向 MCP 调用端明确报错（`RuntimeError`）**，无本地降级。本地关键词提取质量不足以替代语义打标与合并，静默降级比报错更危险（可能产生错误分类记忆）。 |
 | `embedding_engine.search_similar()` | `enabled=False` | 直接返回 `[]`，调用方 fallback 到 keyword 搜索 |
+| `breath(importance_min)` | 未找到达标记忆 | 返回 `"没有重要度 >= X 的记忆。"` |
+| `breath(domain="feel")` | 暂无 feel 数据 | 返回 `"没有留下过 feel。"` |
+| `breath(domain="private")` | 暂无已解锁日记 | 返回 `"没有解锁的私密日记。"` |
+| `dream()` 历史梦境检索 | embedding 异常或未开启 | `logger.warning()`，无历史轨迹挂载，仅依赖本次传入候选生成结晶 |
 
 ---
 
@@ -520,9 +552,13 @@ Claude 决策: hold / grow / 自动
           │      → _time_ripple(source_id, now, hours=48)           │
           │        对 48h 内邻近桶 activation_count += 0.3           │
           │                                                           │
-          │  被 dream() 消化:                                        │
-          │    hold(feel=True, source_bucket=id) →                  │
-          │    bucket_mgr.update(id, digested=True)                 │
+          │  手动消化 (Manual Feel - 狙击模式):                       │
+          │    hold(feel=True, source_bucket=id) →                   │
+          │    bucket_mgr.update(id, digested=True)                  │
+          │                                                           │
+          │  自动梦境消化 (Automated Dream - 捞网模式):               │
+          │    trace(dream_candidate=True) → dream() 抓取处理 →      │
+          │    bucket_mgr.update(id, dream_candidate=False, digested=True) │
           │                                                           │
           │  被 trace(resolved=1) 标记:                              │
           │    resolved=True → decay score ×0.05 (或 ×0.02)        │
@@ -572,7 +608,7 @@ hold(feel=True, source_bucket="xxx", valence=0.45)
                     加速衰减直到归档
 
 feel 桶自身:
-  - calculate_score() 返回固定 50.0
+  - calculate_score() 返回 10 + 40×e^(-0.05t)（缓慢衰减至 10 分）
   - 不参与普通 breath 浮现
   - 不参与 dreaming 候选
   - 只通过 breath(domain="feel") 读取
@@ -612,13 +648,15 @@ feel 桶自身:
 | **B-08** | 场景8 | 低 | `run_decay_cycle()` 内 auto_resolve 后继续使用旧 `meta` 变量计算 score，`resolved_factor=0.05` 需等下一 cycle 才生效。 | **修复**：auto_resolve 成功后执行 `meta["resolved"] = True` 刷新本地 meta 变量。 |
 | **B-09** | 场景3 | 低 | `hold()` 非 feel 路径中，用户显式传入的 `valence`/`arousal` 被 `analyze()` 返回值完全覆盖。 | **修复**：若用户显式传入（`0 <= valence <= 1`），优先使用用户值，`analyze()` 结果作为 fallback。 |
 | **B-10** | 场景10 | 低 | feel 桶以 `domain=[]` 创建，但 `bucket_manager.create()` 中 `domain or ["未分类"]` 兜底写入 `["未分类"]`，数据不干净。 | **修复**：`create()` 中对 `bucket_type=="feel"` 单独处理，允许空 domain 直接写入。 |
+| **B-11** | 场景9 | 中 | `dream()` 消化素材后，只清除了 `dream_candidate=False`，未按规格书设置 `digested=True`，导致这部分源记忆缺乏 `0.02` 加速衰减系数。 | **修复**：`server.py` 的 `dream()` 循环中加入 `digested=True` 状态变更。 |
+| **B-12** | 场景10 | 中 | 原规格中普通 feel 固定 50.0 分，导致 Manual Feel 单向永久堆积，旧情绪永远高于旧梦境。 | **决策：废弃“固定50分”设定**。修改 `decay_engine.py` 让所有 feel（包含 Manual Feel）统一使用指数底线衰减（10+40×e^-0.05t）。 |
 
 ---
 
 ### 5.3 已确认正常实现
 
 - `breath()` 浮现模式不调用 `touch()`，不重置衰减计时器
-- `feel` 桶 `calculate_score()` 返回固定 50.0，永不归档
+- `feel` 桶 `calculate_score()` 统一衰减至 10.0，永不归档
 - `breath(domain="feel")` 独立通道，按 `created` 降序，不压缩展示原文
 - `decay_engine.calculate_score()` 短期（≤3天）/ 长期（>3天）权重分离公式
 - `urgency_boost`：`arousal > 0.7 && !resolved → ×1.5`

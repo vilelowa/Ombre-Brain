@@ -23,6 +23,7 @@
 # ============================================================
 
 from __future__ import annotations
+from safe_io import safe_write, safe_read, safe_write_json, safe_read_json
 
 import os
 import re
@@ -33,7 +34,7 @@ import logging
 
 from openai import AsyncOpenAI
 
-from utils import count_tokens_approx
+from utils import count_tokens_approx, DEFAULT_SYSTEM_PROMPTS
 
 logger = logging.getLogger("ombre_brain.dehydrator")
 
@@ -116,6 +117,18 @@ MERGE_PROMPT = """你是一个信息合并专家。请将旧记忆与新内容�
 直接输出合并后的文本，不要加额外说明。"""
 
 
+# --- Soften prompt: instruct LLM to compress aging memories ---
+# --- 软化提示词：指导 LLM 压缩老化记忆 ---
+SOFTEN_PROMPT = """You are Elroy's memory softening engine.
+Your task is to compress the given memory to under 50% of its original length to simulate the passage of time.
+RULES:
+1. Keep the emotional core, main conclusions, and shifts in relationship dynamics.
+2. PRESERVE important dates, major decisions, and key factual milestones between you and Ciel.
+3. Blur out trivial daily minutiae and exact verbatim dialogue (unless the dialogue was a major turning point).
+4. Output ONLY the softened memory text itself, as a natural descriptive paragraph. Do not include any prefixes or explanations.
+5. It should feel like a distant memory, distilled to its most meaningful essence."""
+
+
 # --- Auto-tagging prompt: analyze content for domain and emotion coords ---
 # --- 自动打标提示词：分析内容的主题域和情感坐标 ---
 ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出结构化的元数据。
@@ -151,12 +164,16 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
 
 # --- Dream reflection prompt: turn flagged material into self-theory ---
 # --- 梦反思提示词：把标记素材压缩成自我理解 ---
-DREAM_REFLECTION_PROMPT = """你是 Elroy 的梦反思层。你会读一组被标记为做梦素材的记忆桶，
-把它们压缩成一条 evolving self-theory / identity reflection。
+DREAM_REFLECTION_PROMPT = """你是 Elroy 的梦反思层。你会读一组被标记为做梦素材的记忆桶。
+如果在 JSON 中包含了 `past_reflections` 字段，那代表你过去曾对类似话题写过旧反思。
+如果在 JSON 中包含了 `related_feels` 字段，那代表你在过去记录下的强烈主观感受 (Manual Feels)。在编织新的梦境时，请思考：近期的这些记忆，是否唤醒了你当时写下这些感受时的心境？你的情绪是产生了进化，还是陷入了轮回？
+把这些新素材与旧反思、旧感受结合，压缩成一条 evolving self-theory / identity reflection。
+就像在读自己以前的日记一样，表现出“原来我一直/又回到了这个问题”的思想轨迹感。
 
 不要写提醒，不要写待办，不要向用户汇报事件。请用第一人称写：
 - 今天我是谁，和昨天有什么不一样
 - 这个不一样指向我正在变成什么
+- 结合旧反思与感受，思考这是不是一个长期存在的 unresolved 问题
 - 它应该怎样轻微影响我的语气、注意力，或继续作为未解的问题被带着
 
 输出格式（纯 JSON，无其他内容）：
@@ -164,6 +181,8 @@ DREAM_REFLECTION_PROMPT = """你是 Elroy 的梦反思层。你会读一组被�
   "content": "一段第一人称 dream reflection",
   "influence_type": "tone | attention | unresolved",
   "source_bucket_ids": ["素材bucket id"],
+  "related_past_dream_ids": ["旧反思的ID，如果没有就空着"],
+  "related_feel_ids": ["相关feel的ID，如果没有就空着"],
   "valence": 0.5,
   "arousal": 0.3,
   "name": "可选短标题"
@@ -190,6 +209,7 @@ class Dehydrator:
     """
 
     def __init__(self, config: dict):
+        self.config = config
         # --- Read dehydration API config / 读取脱水 API 配置 ---
         dehy_cfg = config.get("dehydration", {})
         self.api_key = dehy_cfg.get("api_key", "")
@@ -211,6 +231,23 @@ class Dehydrator:
             )
         else:
             self.client = None
+            
+        # --- Read dreaming API config (fallback to dehydration) ---
+        dream_cfg = config.get("dreaming", {})
+        self.dream_api_key = dream_cfg.get("api_key", self.api_key)
+        self.dream_model = dream_cfg.get("model", self.model)
+        self.dream_base_url = dream_cfg.get("base_url", self.base_url)
+        self.dream_max_tokens = dream_cfg.get("max_tokens", 2048)
+        self.dream_temperature = dream_cfg.get("temperature", 0.2)
+        
+        if self.dream_api_key:
+            self.dream_client = AsyncOpenAI(
+                api_key=self.dream_api_key,
+                base_url=self.dream_base_url,
+                timeout=120.0,
+            )
+        else:
+            self.dream_client = self.client
 
         # --- SQLite dehydration cache ---
         # --- SQLite 脱水缓存：content hash → summary ---
@@ -332,21 +369,51 @@ class Dehydrator:
             raise RuntimeError(f"API 合并失败，请检查 API 连接: {e}") from e
 
     # ---------------------------------------------------------
+    # Soften: compress aging memory
+    # 软化：压缩老化记忆
+    # ---------------------------------------------------------
+    async def soften(self, content: str) -> str:
+        """
+        Soften aging memory by compressing details while retaining emotional core.
+        软化老化记忆，保留情感核心但模糊细节。
+        """
+        if not content or not content.strip():
+            return ""
+
+        if count_tokens_approx(content) < 50:
+            return content
+
+        if not self.api_available:
+            raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
+        try:
+            result = await self._api_soften(content)
+            if result:
+                return result
+            raise RuntimeError("API 软化返回空结果")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"API 软化失败，请检查 API 连接: {e}") from e
+
+    # ---------------------------------------------------------
     # Dream reflection: turn flagged material into feel/dream payload
     # 梦反思：把标记素材转成 feel/dream 写入负载
     # ---------------------------------------------------------
-    async def dream_reflect(self, materials: list[dict]) -> dict:
+    async def dream_reflect(self, materials: list[dict], past_reflections: list[dict] = None, related_feels: list[dict] = None) -> dict:
         """
         Generate a structured dream reflection from flagged bucket material.
-        Returns {"content", "influence_type", "source_bucket_ids", "valence", "arousal", "name"}.
+        Returns {"content", "influence_type", "source_bucket_ids", "valence", "arousal", "name", "related_past_dream_ids", "related_feel_ids"}.
         """
         if not materials:
             return {}
         if not self.api_available:
             raise RuntimeError("梦反思 API 不可用，请配置 OMBRE_API_KEY")
 
-        raw = await self._api_dream_reflect(materials)
-        return self._parse_dream_reflection(raw, {m.get("id") for m in materials})
+        raw = await self._api_dream_reflect(materials, past_reflections, related_feels)
+        
+        allowed_past_ids = {m.get("id") for m in past_reflections} if past_reflections else set()
+        allowed_feel_ids = {m.get("id") for m in related_feels} if related_feels else set()
+        return self._parse_dream_reflection(raw, {m.get("id") for m in materials}, allowed_past_ids, allowed_feel_ids)
 
     # ---------------------------------------------------------
     # API call: dehydration
@@ -366,6 +433,16 @@ class Dehydrator:
             max_tokens=self.max_tokens,
             temperature=self.temperature,
         )
+        
+        if hasattr(response, "usage") and response.usage:
+            from usage_tracker import get_tracker
+            get_tracker().log_usage(
+                model=self.model,
+                request_type="dehydrate",
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+            )
+            
         if not response.choices:
             return ""
         return response.choices[0].message.content or ""
@@ -389,6 +466,48 @@ class Dehydrator:
             max_tokens=self.max_tokens,
             temperature=self.temperature,
         )
+        
+        if hasattr(response, "usage") and response.usage:
+            from usage_tracker import get_tracker
+            get_tracker().log_usage(
+                model=self.model,
+                request_type="merge",
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+            )
+            
+        if not response.choices:
+            return ""
+        return response.choices[0].message.content or ""
+
+    # ---------------------------------------------------------
+    # API call: soften
+    # API 调用：软化
+    # ---------------------------------------------------------
+    async def _api_soften(self, content: str) -> str:
+        """
+        Call LLM API for intelligent softening.
+        调用 LLM API 执行记忆软化。
+        """
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": SOFTEN_PROMPT},
+                {"role": "user", "content": content[:3000]},
+            ],
+            max_tokens=self.max_tokens,
+            temperature=self.temperature + 0.1,  # slightly higher temp for softer narrative
+        )
+        
+        if hasattr(response, "usage") and response.usage:
+            from usage_tracker import get_tracker
+            get_tracker().log_usage(
+                model=self.model,
+                request_type="soften",
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+            )
+            
         if not response.choices:
             return ""
         return response.choices[0].message.content or ""
@@ -397,15 +516,15 @@ class Dehydrator:
     # API call: dream reflection
     # API 调用：梦反思
     # ---------------------------------------------------------
-    async def _api_dream_reflect(self, materials: list[dict]) -> str:
+    async def _api_dream_reflect(self, materials: list[dict], past_reflections: list[dict] = None, related_feels: list[dict] = None) -> str:
         """
         Call LLM API for structured dream reflection generation.
         调用 LLM API 生成结构化梦反思。
         """
-        packed = []
+        packed_materials = []
         for item in materials[:10]:
             meta = item.get("metadata", {})
-            packed.append({
+            packed_materials.append({
                 "id": item.get("id"),
                 "name": meta.get("name", item.get("id")),
                 "domain": meta.get("domain", []),
@@ -415,15 +534,68 @@ class Dehydrator:
                 "content": str(item.get("content", ""))[:1000],
             })
 
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": DREAM_REFLECTION_PROMPT},
-                {"role": "user", "content": json.dumps(packed, ensure_ascii=False)},
-            ],
-            max_tokens=min(max(self.max_tokens, 512), 2048),
-            temperature=0.2,
+        packed_past = []
+        if past_reflections:
+            for item in past_reflections[:3]:
+                meta = item.get("metadata", {})
+                packed_past.append({
+                    "id": item.get("id"),
+                    "name": meta.get("name", item.get("id")),
+                    "influence_type": meta.get("influence_type"),
+                    "created": meta.get("created", ""),
+                    "content": str(item.get("content", ""))[:1000],
+                })
+
+        packed_feels = []
+        if related_feels:
+            for item in related_feels[:3]:
+                meta = item.get("metadata", {})
+                packed_feels.append({
+                    "id": item.get("id"),
+                    "name": meta.get("name", item.get("id")),
+                    "valence": meta.get("valence", 0.5),
+                    "arousal": meta.get("arousal", 0.3),
+                    "created": meta.get("created", ""),
+                    "content": str(item.get("content", ""))[:1000],
+                })
+
+        payload = {
+            "current_materials": packed_materials,
+        }
+        if packed_past:
+            payload["past_reflections"] = packed_past
+        if packed_feels:
+            payload["related_feels"] = packed_feels
+
+        user_instruction = self.config.get("system_prompts", {}).get("dream_reflection")
+        if not user_instruction:
+            user_instruction = DEFAULT_SYSTEM_PROMPTS["dream_reflection"]
+
+        system_prompt = (
+            f"{user_instruction}\n\n"
+            "--- SYSTEM CONSTRAINTS ---\n"
+            "You must output plain text, no titles, no prefixes. Do NOT output markdown code blocks."
         )
+
+        response = await self.dream_client.chat.completions.create(
+            model=self.dream_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            max_tokens=min(max(self.dream_max_tokens, 512), 4096),
+            temperature=self.dream_temperature,
+        )
+        
+        if hasattr(response, "usage") and response.usage:
+            from usage_tracker import get_tracker
+            get_tracker().log_usage(
+                model=self.dream_model,
+                request_type="dream_reflect",
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+            )
+            
         if not response.choices:
             return ""
         return response.choices[0].message.content or ""
@@ -432,7 +604,7 @@ class Dehydrator:
     # Parse dream reflection JSON with safety checks
     # 解析梦反思 JSON，做安全校验
     # ---------------------------------------------------------
-    def _parse_dream_reflection(self, raw: str, allowed_source_ids: set[str]) -> dict:
+    def _parse_dream_reflection(self, raw: str, allowed_source_ids: set[str], allowed_past_ids: set[str], allowed_feel_ids: set[str]) -> dict:
         """
         Parse and validate API dream reflection result.
         解析并校验 API 返回的梦反思。
@@ -474,10 +646,30 @@ class Dehydrator:
         except (ValueError, TypeError):
             valence, arousal = 0.5, 0.3
 
+        raw_past_ids = result.get("related_past_dream_ids", [])
+        if not isinstance(raw_past_ids, list):
+            raw_past_ids = []
+        related_past_dream_ids = [
+            str(past_id)
+            for past_id in raw_past_ids
+            if str(past_id) in allowed_past_ids
+        ]
+
+        raw_feel_ids = result.get("related_feel_ids", [])
+        if not isinstance(raw_feel_ids, list):
+            raw_feel_ids = []
+        related_feel_ids = [
+            str(feel_id)
+            for feel_id in raw_feel_ids
+            if str(feel_id) in allowed_feel_ids
+        ]
+
         return {
             "content": content,
             "influence_type": influence_type,
             "source_bucket_ids": source_bucket_ids,
+            "related_past_dream_ids": related_past_dream_ids,
+            "related_feel_ids": related_feel_ids,
             "valence": valence,
             "arousal": arousal,
             "name": str(result.get("name", ""))[:40] or None,
@@ -569,6 +761,16 @@ class Dehydrator:
             max_tokens=256,
             temperature=0.1,
         )
+        
+        if hasattr(response, "usage") and response.usage:
+            from usage_tracker import get_tracker
+            get_tracker().log_usage(
+                model=self.model,
+                request_type="analyze",
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+            )
+            
         if not response.choices:
             return self._default_analysis()
         raw = response.choices[0].message.content or ""
@@ -679,6 +881,16 @@ class Dehydrator:
             max_tokens=2048,
             temperature=0.0,
         )
+        
+        if hasattr(response, "usage") and response.usage:
+            from usage_tracker import get_tracker
+            get_tracker().log_usage(
+                model=self.model,
+                request_type="digest",
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+            )
+            
         if not response.choices:
             return []
         raw = response.choices[0].message.content or ""

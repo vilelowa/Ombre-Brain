@@ -11,8 +11,8 @@ self.addEventListener('push', function(event) {
   const title = data.title || 'Elroy';
   const options = {
     body: data.body || 'New message from Elroy',
-    icon: data.icon || '/icon.png',
-    badge: data.badge || '/icon.png',
+    icon: data.icon || '/undertow/seal_badge.PNG',
+    badge: data.badge || '/undertow/seal_badge.PNG',
     data: {
       url: data.url || '/'
     }

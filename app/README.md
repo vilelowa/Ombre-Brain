@@ -1,20 +1,35 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# Albireo PWA Frontend
 
-# Run and deploy your AI Studio app
+Albireo is the mobile-first Progressive Web App for Ombre Brain, built with React, Vite, TypeScript, and Lucide Icons.
 
-This contains everything you need to run your app locally.
+## Features
 
-View your app in AI Studio: https://ai.studio/apps/f1833b70-0a29-4949-a598-c5d2b980b242
+- **Proximity**: Live chat, SSE reasoning, personas, conversations, folders, and dream flagging.
+- **Undertow**: Memories, dreams, calendar traces, awakening controls, and private diary.
+- **Marginalia**: Bookshelf, reader, bookmarks, notes, and reading progress.
+- **Meridian**: Persona, model, storage, diagnostics, token statistics, and Web Push controls.
 
-## Run Locally
+## Development
 
-**Prerequisites:**  Node.js
+### Running Locally
 
+1. **Install dependencies**:
+   ```bash
+   npm install
+   ```
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+2. **Configure environment**:
+   Make sure you have your `.env` configured. Create `app/.env` (or copy `.env.example`) and set:
+   ```env
+   VITE_API_BASE_URL="http://localhost:8000"
+   ```
+
+3. **Start the Vite dev server**:
+   ```bash
+   npm run dev
+   ```
+
+### Formatting and Building
+
+- **Lint**: `npm run lint`
+- **Build**: `npm run build`

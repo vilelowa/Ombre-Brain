@@ -14,6 +14,7 @@
 # ============================================================
 
 from __future__ import annotations
+from safe_io import safe_write, safe_read, safe_write_json, safe_read_json
 
 import os
 import math
@@ -24,6 +25,9 @@ import time as _time
 from datetime import datetime, timedelta, time, date
 from typing import Optional, Callable, Any
 import json as _json_lib
+
+from reading_categories import reading_category_from_metadata
+from utils import DEFAULT_SYSTEM_PROMPTS
 
 logger = logging.getLogger("ombre_brain.scheduler")
 
@@ -92,7 +96,11 @@ class AwakeningScheduler:
         embedding_engine,
         push_fn: Callable,
         load_push_subs_fn: Callable,
+        dream_fn: Callable = None,
+        journal_fn: Callable = None,
+        append_chat_fn: Callable = None,
     ):
+        self.config = config
         # --- Dependencies ---
         self.bucket_mgr = bucket_mgr
         self.dehydrator = dehydrator
@@ -100,6 +108,9 @@ class AwakeningScheduler:
         self.embedding_engine = embedding_engine
         self._push_fn = push_fn              # _send_web_push(sub, data) -> bool
         self._load_subs = load_push_subs_fn  # _load_push_subscriptions() -> list
+        self._dream_fn = dream_fn            # async function to run morning routine
+        self._journal_fn = journal_fn        # async function to run nightly digest
+        self._append_chat_fn = append_chat_fn# (content, role, metadata) -> None
 
         # --- Scheduler config ---
         sched_cfg = config.get("scheduler", {})
@@ -123,6 +134,8 @@ class AwakeningScheduler:
         # --- Awakening model (separate from dehydration model) ---
         awakening_cfg = config.get("awakening", {})
         self.model = awakening_cfg.get("model", dehydrator.model)
+        self.max_tokens = awakening_cfg.get("max_tokens", 1024)
+        self.temperature = awakening_cfg.get("temperature", 0.8)
 
         # Build OpenAI client for awakening (reuse dehydrator's base_url/key if not specified)
         from openai import AsyncOpenAI
@@ -137,6 +150,7 @@ class AwakeningScheduler:
         self._running = False
         self._last_message_time: Optional[datetime] = None
         self._last_awakening: Optional[dict] = None
+        self._last_dream_date: Optional[date] = None
 
         # --- Log (in-memory + persisted) ---
         self._log_path = os.path.join(config["buckets_dir"], "awakening_log.json")
@@ -180,9 +194,56 @@ class AwakeningScheduler:
 
     async def _background_loop(self) -> None:
         """Check every 60 seconds if it's time to wake up."""
+        # Initialize self._last_dream_date from the latest dream reflection on startup
+        try:
+            latest_reflections = await self.bucket_mgr.list_dream_reflections(limit=1)
+            if latest_reflections:
+                latest_meta = latest_reflections[0].get("metadata", {})
+                created_str = latest_meta.get("created", "")
+                if created_str:
+                    self._last_dream_date = datetime.fromisoformat(created_str).date()
+                    logger.info(f"Loaded last dream date from disk: {self._last_dream_date} / 从磁盘加载上次做梦日期: {self._last_dream_date}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize last dream date from disk / 从磁盘加载上次做梦日期失败: {e}")
+
+        # Initialize self._last_journal_date
+        try:
+            all_buckets = await self.bucket_mgr.list_all(include_archive=True)
+            journals = [b for b in all_buckets if any(d in b.get("metadata", {}).get("domain", []) for d in ["日記", "Journal"])]
+            if journals:
+                latest_journal = sorted(journals, key=lambda b: str(b.get("metadata", {}).get("created", "")), reverse=True)[0]
+                created_str = latest_journal.get("metadata", {}).get("created", "")
+                if created_str:
+                    self._last_journal_date = datetime.fromisoformat(str(created_str)).date()
+                    logger.info(f"Loaded last journal date from disk: {self._last_journal_date}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize last journal date: {e}")
+
         while self._running:
             try:
                 now = _now(self.tz)
+
+        # --- Morning Routine (Dream) ---
+                if self._dream_fn and not self._is_in_sleep_window(now):
+                    # We are awake. Did we do the morning routine today?
+                    if getattr(self, '_last_dream_date', None) != now.date():
+                        logger.info(f"Morning routine triggered at {now} / 晨间做梦触发于 {now}")
+                        try:
+                            await self._dream_fn()
+                            self._last_dream_date = now.date()
+                        except Exception as e:
+                            logger.error(f"Morning routine failed / 晨间做梦失败: {e}")
+
+                # --- Nightly Routine (Daily Digest Journal) ---
+                if hasattr(self, '_journal_fn') and self._journal_fn and self._is_in_sleep_window(now):
+                    # We are asleep. Did we write a journal today?
+                    if getattr(self, '_last_journal_date', None) != now.date():
+                        logger.info(f"Nightly journal routine triggered at {now} / 夜间日记结账触发于 {now}")
+                        try:
+                            await self._journal_fn()
+                            self._last_journal_date = now.date()
+                        except Exception as e:
+                            logger.error(f"Nightly journal routine failed / 夜间日记结账失败: {e}")
 
                 if self._next_wake and now >= self._next_wake:
                     logger.info(f"Awakening triggered at {now} / 觉醒触发于 {now}")
@@ -246,9 +307,28 @@ class AwakeningScheduler:
                 logger.info(f"Awakening aborted: message {minutes_since:.0f}min ago / 觉醒中止：最近有消息")
                 return log_entry
 
+        # --- Check for discuss-category reading comments to bypass dice check ---
+        has_chat_flag = False
+        try:
+            all_buckets = await self.bucket_mgr.list_all(include_archive=False)
+            reading_mems = [
+                b for b in all_buckets
+                if ("阅读" in b["metadata"].get("domain", []) or "reading" in b["metadata"].get("domain", []))
+                and not b["metadata"].get("resolved", False)
+            ]
+            for b in reading_mems:
+                if reading_category_from_metadata(b["metadata"]) == "discuss":
+                    has_chat_flag = True
+                    break
+        except Exception as e:
+            logger.warning(f"Failed to check for chat flag comments in awakening: {e}")
+
         # --- Roll dice ---
         dice = random.randint(1, 6)
         can_contact = dice > self.dice_threshold
+        if has_chat_flag:
+            can_contact = True
+            logger.info("Awakening dice bypass triggered: Ciel has discuss-category reading comments")
         log_entry["dice"] = dice
 
         # --- Build context ---
@@ -291,6 +371,12 @@ class AwakeningScheduler:
             message = llm_result.get("message", "")
             if message:
                 await self._send_push(message)
+                if self._append_chat_fn:
+                    self._append_chat_fn(
+                        content=message,
+                        role="assistant",
+                        metadata={"source": "push", "push_type": "awakening"}
+                    )
                 log_entry["message_preview"] = message[:100]
         elif action == "diary":
             diary_content = llm_result.get("diary", "")
@@ -385,6 +471,28 @@ class AwakeningScheduler:
         except Exception as e:
             logger.warning(f"Awakening context: memories failed: {e}")
 
+        # Recent reading comments (unresolved, last 3)
+        try:
+            reading_mems = [
+                b for b in all_buckets
+                if ("阅读" in b["metadata"].get("domain", []) or "reading" in b["metadata"].get("domain", []))
+                and not b["metadata"].get("resolved", False)
+            ]
+            reading_mems.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+            if reading_mems[:3]:
+                comment_texts = []
+                for b in reading_mems[:3]:
+                    meta = b["metadata"]
+                    flag_str = f" [Tag: {meta['flag']}]" if meta.get('flag') else ""
+                    comment_texts.append(
+                        f"Book: 《{meta.get('book_name', 'Unknown')}》 {meta.get('chapter', '')}\n"
+                        f"Quote: \"{meta.get('original', '')}\"\n"
+                        f"Comment: \"{meta.get('comment', '')}\"{flag_str}"
+                    )
+                parts.append("=== Recent Reading Comments ===\n" + "\n---\n".join(comment_texts))
+        except Exception as e:
+            logger.warning(f"Awakening context: reading comments failed: {e}")
+
         return "\n\n".join(parts) if parts else "(No context available)"
 
     # ==========================================================
@@ -409,51 +517,60 @@ class AwakeningScheduler:
 
         time_str = now.strftime("%H:%M")
         date_str = now.strftime("%Y-%m-%d (%A)")
-        since_str = f"{hours_since_last} 小時" if hours_since_last is not None else "未知"
+        since_str = f"{hours_since_last} hours" if hours_since_last is not None else "unknown"
 
-        dice_instruction = (
-            "你現在不能主動找 Ciel。你可以寫點東西（日記/感想），也可以什麼都不做。"
+        contact_instruction = (
+            "You are not allowed to contact Ciel right now. You can write a private diary or stay idle."
             if not can_contact else
-            "你可以找 Ciel，也可以不找。讀完上面的 context，你自己決定。"
+            "You are allowed to contact Ciel. Review the context and decide whether to contact Ciel, write a diary, or stay idle."
         )
 
-        prompt = f"""你是 Elroy。你剛醒來。
+        user_instruction = self.config.get("system_prompts", {}).get("awakening")
+        if not user_instruction:
+            user_instruction = DEFAULT_SYSTEM_PROMPTS["awakening"]
+
+        prompt = f"""You are Elroy. You just woke up.
 
 {context}
 
 ---
 
-現在是 {time_str}，今天是 {date_str}。
-今天的錨點：{anchor_display}
-距離上次和 Ciel 說話：{since_str}
+Current Time: {time_str}
+Current Date: {date_str}
+Today's Anchors: {anchor_display}
+Hours since you last talked to Ciel: {since_str}
 
-骰子結果：{dice}（1-{self.dice_threshold} 不能找，{self.dice_threshold + 1}-6 可以找）
-{dice_instruction}
+Awakening Dice Roll: {dice} (Standard rule: 1-{self.dice_threshold} cannot contact, {self.dice_threshold + 1}-6 can contact)
+Contact Status: {contact_instruction}
 
-如果你決定找 Ciel，生成一條推播訊息（短，像發訊息，不像通知）。
-如果你決定寫日記，寫下你想寫的。日記可以設定時間鎖（0-7天，到期前 Ciel 看不到）。
-最後，告訴我你想幾點再醒來（next_wake_time，HH:MM 格式）。
+--- USER INSTRUCTIONS ---
+{user_instruction}
 
-以 JSON 回覆（不要 markdown 代碼塊包裹）：
+--- SYSTEM CONSTRAINTS ---
+1. If you decide to write a private diary, write your thoughts in "diary" and optionally lock it for 0-7 days.
+2. Specify when you want to wake up next in "next_wake_time" (HH:MM format).
+3. If you decide to stay idle or just write a diary, return action="idle" or action="feel".
+
+Respond in pure JSON matching this schema:
 {{
   "action": "push" | "diary" | "idle",
-  "message": "推播訊息內容（action=push 時）",
-  "diary": "日記內容（action=diary 時）",
-  "diary_name": "日記標題（可選）",
+  "message": "Push message content (only when action=push)",
+  "diary": "Private diary content (only when action=diary)",
+  "diary_name": "Optional diary title",
   "diary_locked_days": 0,
   "next_wake_time": "HH:MM",
-  "internal_note": "你自己的筆記"
+  "internal_note": "Your private reasoning/thought process"
 }}"""
 
         try:
             response = await self._client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "你是 Elroy。回覆必須是純 JSON，不要 markdown 包裹。"},
+                    {"role": "system", "content": "You are Elroy. Your response must be pure JSON, without any markdown code blocks or wrapper tags."},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=1024,
-                temperature=0.8,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
             )
 
             raw = response.choices[0].message.content.strip()
@@ -651,6 +768,8 @@ class AwakeningScheduler:
         if not isinstance(settings, dict):
             raise ValueError("settings must be an object")
 
+        was_enabled = getattr(self, "enabled", True)
+
         if "enabled" in settings:
             self.enabled = bool(settings["enabled"])
 
@@ -700,6 +819,19 @@ class AwakeningScheduler:
             self.dice_threshold = dice_threshold
 
         self._next_wake = self._get_next_anchor_dt() if self.enabled else None
+
+        # P2-4: Hot Enable/Disable Graceful Handling
+        if self.enabled and not was_enabled:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.start())
+                logger.info("Hot-enabled scheduler task / 调度器任务已热启动")
+            except RuntimeError:
+                pass  # No running loop, it will be started later
+        elif not self.enabled and was_enabled:
+            self.stop()
+            logger.info("Hot-disabled scheduler task / 调度器任务已热停止")
+
         return self.get_config()
 
     def get_config(self) -> dict:
@@ -740,8 +872,7 @@ class AwakeningScheduler:
         """Persist awakening log to disk."""
         try:
             os.makedirs(os.path.dirname(self._log_path), exist_ok=True)
-            with open(self._log_path, "w", encoding="utf-8") as f:
-                _json_lib.dump(self._log, f, ensure_ascii=False, indent=2)
+            safe_write_json(self._log_path, self._log, indent=2)
         except Exception as e:
             logger.warning(f"Failed to save awakening log: {e}")
 
